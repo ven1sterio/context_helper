@@ -197,7 +197,7 @@ export class WsServer {
                             tree: this.contextManager.buildTree(),
                             files: result.included.length + result.skeleton.length,
                             chars: result.chars, tokens: result.tokens,
-                            included: result.included, skeleton: result.skeleton
+                            included: result.included, skeleton: result.skeleton, missing: result.missing
                         });
                     } catch (e) {
                         send({ type: 'selectionContext', error: 'Falha ao montar contexto: ' + (e instanceof Error ? e.message : String(e)) });
@@ -273,7 +273,7 @@ export class WsServer {
 
     private selectLocal(request: string): ScoredFile[] {
         if (!this.indexer) return [];
-        return selectFiles(request, this.indexer.getIndex(), 25);
+        return selectFiles(request, this.indexer.getIndex(), 40);
     }
 
     private broadcastConfig(): void {

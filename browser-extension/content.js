@@ -456,7 +456,8 @@ async function applySelection() {
     nextIsDelta = true;
 
     const kTokens = ((res.tokens || 0) / 1000).toFixed(1);
-    const extra = (res.skeleton && res.skeleton.length > 0) ? ` (${res.skeleton.length} como esqueleto)` : '';
+    let extra = (res.skeleton && res.skeleton.length > 0) ? ` (${res.skeleton.length} só como esqueleto)` : '';
+    if (res.missing && res.missing.length > 0) extra += ` ⚠️ ${res.missing.length} sem conteúdo no VS Code: ${res.missing.slice(0, 3).join(', ')}`;
     toast(`🎯 Contexto seletivo: ${res.files} arquivo(s)${extra}, ~${kTokens}k tokens.`);
     hideSelection();
     updateUI();

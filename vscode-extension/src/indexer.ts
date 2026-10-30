@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { isExcludedPath } from './pathRules';
 
-const INDEX_VERSION = 1;
+const INDEX_VERSION = 2; // v2: resolve alias '@/' e reconcilia índice antigo
 const INDEX_DIR = '.deepseek-sync';
 const INDEX_FILE = 'index.json';
 const SAVE_DEBOUNCE_MS = 1500;
@@ -206,9 +206,20 @@ function extractForFile(rel: string, text: string) {
 }
 
 function resolveImport(fromRel: string, spec: string, allPaths: Set<string>): string | null {
-    if (!spec.startsWith('.')) return null;
-    const fromDir = path.posix.dirname(fromRel);
-    const base = path.posix.normalize(path.posix.join(fromDir, spec));
+    let base: string;
+    if (spec.startsWith('.')) {
+        const fromDir = path.posix.dirname(fromRel);
+        base = path.posix.normalize(path.posix.join(fromDir, spec));
+    } else if (spec.startsWith('@/') || spec.startsWith('~/')) {
+        // alias comum do Next.js/Vite (jsconfig "@/*"): raiz do projeto ou src/
+        const sub = spec.slice(2);
+        const tries = [sub, 'src/' + sub];
+        const hit = tries.find(t => [t, t + '.js', t + '.jsx', t + '.ts', t + '.tsx', t + '/index.js', t + '/index.jsx', t + '/index.ts', t + '/index.tsx'].some(c => allPaths.has(c)));
+        if (!hit) return null;
+        base = hit;
+    } else {
+        return null;
+    }
     if (base.startsWith('..')) return null;
 
     const candidates = [
@@ -273,7 +284,7 @@ export class Indexer implements vscode.Disposable {
     async initialize(provider: FileContentProvider): Promise<void> {
         this.provider = provider;
         const loaded = await this.loadFromDisk();
-        if (loaded) this.index = loaded;
+        if (loaded) { this.index = loaded; this.reconcile(provider); }
         else this.rebuildAll(provider);
 
         this.ready = true;
@@ -293,6 +304,33 @@ export class Indexer implements vscode.Disposable {
             if (!data.files || typeof data.files !== 'object') return null;
             return data;
         } catch { return null; }
+    }
+
+    /** Índice salvo pode estar velho (arquivos editados com o VS Code fechado): refaz o que mudou. */
+    private reconcile(provider: FileContentProvider): void {
+        const all = provider.getAllFiles();
+        const allPaths = new Set(all.keys());
+        let changed = false;
+        for (const rel of Object.keys(this.index.files)) {
+            if (!all.has(rel)) { delete this.index.files[rel]; changed = true; }
+        }
+        for (const [rel, content] of all) {
+            if (isExcludedPath(rel)) continue;
+            const old = this.index.files[rel];
+            if (!old || old.sha1 !== sha1Of(content)) {
+                this.index.files[rel] = buildEntry(rel, content, allPaths);
+                changed = true;
+            }
+        }
+        // imports de arquivos intactos podem ter mudado de alvo (arquivo criado/removido)
+        for (const [rel, content] of all) {
+            if (isExcludedPath(rel) || !this.index.files[rel]) continue;
+            const fresh = buildEntry(rel, content, allPaths);
+            if (fresh.imports.join('|') !== this.index.files[rel].imports.join('|')) {
+                this.index.files[rel].imports = fresh.imports; changed = true;
+            }
+        }
+        if (changed) { this.dirty = true; this.scheduleSave(); }
     }
 
     private rebuildAll(provider: FileContentProvider): void {
