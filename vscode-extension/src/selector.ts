@@ -115,47 +115,6 @@ export function selectFiles(query: string, index: IndexData, maxFiles = 25): Sco
   return [...scores.values()].sort((a, b) => b.score - a.score).slice(0, maxFiles);
 }
 
-/**
- * Combina seleção local com sugestões do Gemini. Gemini tem prioridade
- * (bônus de base), mas arquivos locais que o Gemini não citou são mantidos.
- * Arquivos com caminho desconhecido no índice são descartados.
- */
-export function mergeWithGemini(
-  local: ScoredFile[],
-  gemini: Array<{ path: string; reason?: string }>,
-  index: IndexData,
-  maxFiles = 25
-): ScoredFile[] {
-  const merged = new Map<string, ScoredFile>();
-
-  for (const g of gemini) {
-    if (!g || typeof g.path !== 'string') continue;
-    const entry = index.files[g.path];
-    if (!entry) continue;
-    merged.set(g.path, {
-      path: g.path,
-      score: 100 + entry.tokens / 100,
-      reasons: [g.reason && g.reason.trim() ? `gemini: ${g.reason.trim().slice(0, 60)}` : 'gemini']
-    });
-  }
-
-  for (const l of local) {
-    const existing = merged.get(l.path);
-    if (existing) {
-      existing.score += l.score;
-      for (const r of l.reasons) {
-        if (existing.reasons.length < 4 && !existing.reasons.includes(r)) {
-          existing.reasons.push(r);
-        }
-      }
-    } else {
-      merged.set(l.path, l);
-    }
-  }
-
-  return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, maxFiles);
-}
-
 export interface SelectiveResult {
   text: string;
   included: string[];

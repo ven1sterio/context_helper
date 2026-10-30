@@ -25,6 +25,8 @@ class BridgeSocket {
     close() { try { this.port.disconnect(); } catch { /* ignore */ } this._finish(); }
 }
 
+function siteName() { return window.DSProviderName || 'DeepSeek'; }
+
 let ws = null;
 let connected = false;
 let waiting = null;
@@ -36,9 +38,7 @@ let reconnectTimer = null;
 let authToken = '';
 let lastConnErrorAt = 0;
 
-let currentTimeouts = { response: 600, run: 600, apply: 780, gemini: 60 };
-let geminiStatus = { enabled: false, quota: null, fetchedAt: 0 };
-let geminiPollTimer = null;
+let currentTimeouts = { response: 600, run: 600, apply: 780 };
 
 let rootEl = null;
 let fab = null;
@@ -57,7 +57,6 @@ let attachBtn = null;
 let tokenBtn = null;
 let timeoutSelect = null;
 let moreBtn = null;
-let geminiBtn = null;
 let toastEl = null;
 let toastTimer = null;
 
@@ -153,7 +152,6 @@ function connect() {
         connected = true;
         nextIsDelta = false;
         updateUI();
-        refreshGeminiStatus();
         console.log('Conectado ao VS Code Context Sync');
     };
 
@@ -192,23 +190,12 @@ function connect() {
             if (typeof msg.runSuccess === 'boolean') text += msg.runSuccess ? ' (execução OK)' : ' (execução falhou)';
             toast(text);
             finishWaitingApply(msg);
-            refreshGeminiStatus();
         } else if (msg.type === 'selection') {
             finishWaitingSelection(msg);
         } else if (msg.type === 'selectionContext') {
             finishWaitingSelection(msg);
         } else if (msg.type === 'state') {
             finishWaitingState(msg);
-        } else if (msg.type === 'geminiStatus') {
-            geminiStatus = {
-                enabled: !!msg.enabled,
-                quota: msg.quota || null,
-                fetchedAt: Date.now()
-            };
-            updateUI();
-        } else if (msg.type === 'summariesStarted') {
-            toast('🤖 Gemini: resumos em segundo plano.');
-            setTimeout(refreshGeminiStatus, 3000);
         } else if (msg.type === 'aborted') {
             console.debug('[DeepSeek Sync] VS Code confirmou abort.');
         } else if (msg.type === 'error') {
@@ -288,53 +275,6 @@ function finishWaitingState(msg) {
 function pushState(patch) {
     if (!isOpen()) return;
     try { ws.send(JSON.stringify({ type: 'updateState', patch })); } catch { /* ignore */ }
-}
-
-// ---------- Gemini ----------
-
-function refreshGeminiStatus() {
-    if (!isOpen()) return;
-    try { ws.send(JSON.stringify({ type: 'geminiStatus' })); } catch { /* ignore */ }
-}
-
-function startGeminiPolling() {
-    if (geminiPollTimer) return;
-    geminiPollTimer = setInterval(() => {
-        if (panelExpanded && isOpen()) refreshGeminiStatus();
-    }, 15000);
-}
-
-async function ensurePrivacyAccepted() {
-    try {
-        const r = await chrome.storage.local.get(['geminiPrivacyAccepted']);
-        if (r && r.geminiPrivacyAccepted) return true;
-        const ok = confirm(
-            'Aviso de privacidade do Gemini\n\n' +
-            'Ao ligar o Gemini, o conteúdo NÃO sensível do projeto (resumos e nomes de arquivos/símbolos) ' +
-            'será enviado à API do Google. Arquivos sensíveis (.env, chaves, credenciais) NUNCA são enviados.\n\n' +
-            'No plano gratuito, o Google pode usar o conteúdo para melhorar seus produtos. ' +
-            'Não envie segredos nem dados pessoais.\n\n' +
-            'Continuar?'
-        );
-        if (!ok) return false;
-        await chrome.storage.local.set({ geminiPrivacyAccepted: true });
-        return true;
-    } catch { return false; }
-}
-
-async function handleGeminiButton() {
-    if (!isOpen()) { toast('Sem conexão com o VS Code.'); return; }
-
-    if (!geminiStatus.enabled) {
-        const ok = await ensurePrivacyAccepted();
-        if (!ok) { toast('Gemini não ativado. Você pode ligar depois nas configurações do VS Code.'); return; }
-        toast('Para ligar: no VS Code, ative "deepseekContextSync.geminiEnabled".');
-        try {
-            window.open('vscode://settings/deepseekContextSync.geminiEnabled', '_blank');
-        } catch { /* ignore */ }
-        return;
-    }
-    try { ws.send(JSON.stringify({ type: 'runSummaries' })); } catch { /* ignore */ }
 }
 
 // ---------- Campo de texto (via provider) ----------
@@ -554,7 +494,7 @@ async function handleNewConversation() {
     try { await chrome.storage.local.set({ pendingPrompt: handoff }); }
     catch { /* ignore */ }
 
-    window.open('https://chat.deepseek.com/', '_blank');
+    window.open(getProvider().newChatUrl || (location.origin + '/'), '_blank');
     toast('🆕 Nova conversa aberta. O estado será colado automaticamente no campo.');
 }
 
@@ -752,12 +692,12 @@ async function agentLoop(initialQuestion) {
         }
 
         await humanDelay(HUMAN_DELAY.afterSend);
-        toast(`💬 Iteração ${agentIteration}: aguardando o DeepSeek...`);
+        toast(`💬 Iteração ${agentIteration}: aguardando o ${siteName()}...`);
         const ok = await waitForResponseComplete(currentTimeouts.response * 1000, baseline, showWaitMoreButton);
         if (!ok) {
             if (!agentRunning) return;
-            toast('Timeout: não detectei a resposta do DeepSeek terminar.');
-            pushState({ lastFailure: 'Timeout aguardando a resposta do DeepSeek.' });
+            toast(`Timeout: não detectei a resposta do ${siteName()} terminar.`);
+            pushState({ lastFailure: `Timeout aguardando a resposta do ${siteName()}.` });
             return;
         }
         await sleep(800);
@@ -938,8 +878,6 @@ function injectStyles() {
         .ds-btn.ds-success:hover:not(:disabled) { background: #256428; }
         .ds-btn.ds-ghost { background: transparent; border-color: rgba(255, 255, 255, 0.12); color: #9aa0a6; }
         .ds-btn.ds-ghost:hover:not(:disabled) { color: #e8eaed; border-color: rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.04); }
-        .ds-btn.ds-gemini-on { background: #1e40af; color: #fff; }
-        .ds-btn.ds-gemini-on:hover:not(:disabled) { background: #1e3a8a; }
         .ds-select {
             flex: 0 0 auto; padding: 7px 6px; border: 1px solid rgba(255, 255, 255, 0.12);
             border-radius: 8px; background: rgba(255, 255, 255, 0.06); color: #e8eaed;
@@ -1001,10 +939,6 @@ function togglePanel() {
     panelExpanded = !panelExpanded;
     if (panel) panel.classList.toggle('ds-open', panelExpanded);
     updateUI();
-    if (panelExpanded) {
-        refreshGeminiStatus();
-        startGeminiPolling();
-    }
 }
 
 function updateUI() {
@@ -1054,7 +988,7 @@ function updateUI() {
         newConvBtn.disabled = !connected;
         newConvBtn.title = agentRunning
             ? 'Para o agente e abre uma conversa nova com o estado do projeto.'
-            : 'Abre uma conversa nova do DeepSeek com o estado atual no campo.';
+            : 'Abre uma conversa nova com o estado atual no campo.';
     }
 
     if (tokenBtn) {
@@ -1068,21 +1002,6 @@ function updateUI() {
         if (Array.from(timeoutSelect.options).some(o => o.value === v)) timeoutSelect.value = v;
     }
 
-    if (geminiBtn) {
-        geminiBtn.classList.remove('ds-ghost', 'ds-gemini-on');
-        if (geminiStatus.enabled) {
-            geminiBtn.classList.add('ds-gemini-on');
-            const q = geminiStatus.quota;
-            const used = q ? q.used : '?';
-            const limit = q ? q.limit : '?';
-            geminiBtn.textContent = `🤖 Gemini ON · ${used}/${limit}`;
-            geminiBtn.title = 'Gemini ligado. Clique para gerar resumos agora.';
-        } else {
-            geminiBtn.classList.add('ds-ghost');
-            geminiBtn.textContent = '🤖 Gemini OFF';
-            geminiBtn.title = 'Gemini desligado. Clique para instruções de como ligar.';
-        }
-    }
 }
 
 function addUI() {
@@ -1108,7 +1027,7 @@ function addUI() {
     statusDot = document.createElement('span');
     statusDot.className = 'ds-status-dot';
     statusLabelEl = document.createElement('span');
-    statusLabelEl.textContent = 'DeepSeek Sync';
+    statusLabelEl.textContent = siteName() + ' Sync';
     statusRow.append(statusDot, statusLabelEl);
 
     fullCodeToggle = document.createElement('button');
@@ -1171,14 +1090,8 @@ function addUI() {
     newConvBtn.type = 'button';
     newConvBtn.className = 'ds-btn ds-ghost';
     newConvBtn.textContent = '🆕 Nova conversa';
-    newConvBtn.title = 'Abre uma conversa nova do DeepSeek com o estado do projeto no campo.';
+    newConvBtn.title = 'Abre uma conversa nova com o estado do projeto no campo.';
     newConvBtn.onclick = handleNewConversation;
-
-    geminiBtn = document.createElement('button');
-    geminiBtn.type = 'button';
-    geminiBtn.className = 'ds-btn ds-ghost';
-    geminiBtn.textContent = '🤖 Gemini';
-    geminiBtn.onclick = handleGeminiButton;
 
     attachBtn = document.createElement('button');
     attachBtn.type = 'button';
@@ -1222,16 +1135,15 @@ function addUI() {
     const row3 = document.createElement('div'); row3.className = 'ds-row'; row3.append(selectBtn, timeoutSelect);
     const row4 = document.createElement('div'); row4.className = 'ds-row'; row4.append(attachBtn);
     const rowPause = document.createElement('div'); rowPause.className = 'ds-row'; rowPause.append(moreBtn);
-    const rowGemini = document.createElement('div'); rowGemini.className = 'ds-row'; rowGemini.append(geminiBtn);
     const row5 = document.createElement('div'); row5.className = 'ds-row'; row5.append(newConvBtn);
     const row6 = document.createElement('div'); row6.className = 'ds-row'; row6.append(tokenBtn);
 
-    panel.append(closeBtn, statusRow, row1, row2, row3, row4, rowPause, selPanel, rowGemini, row5, row6);
+    panel.append(closeBtn, statusRow, row1, row2, row3, row4, rowPause, selPanel, row5, row6);
 
     fab = document.createElement('button');
     fab.type = 'button';
     fab.className = 'ds-fab';
-    fab.title = 'DeepSeek Sync (clique para abrir)';
+    fab.title = siteName() + ' Sync (clique para abrir)';
 
     fabIconEl = document.createElement('span');
     fabIconEl.textContent = '🤖';

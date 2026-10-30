@@ -6,14 +6,9 @@ import { WsServer } from './wsServer';
 import { TaskRunner } from './taskRunner';
 import { Indexer } from './indexer';
 import { StateManager } from './stateManager';
-import { QuotaManager } from './quota';
-import { GeminiClient } from './geminiClient';
-import { Summarizer } from './summarizer';
 import { setAllowSensitive, maskSecrets } from './pathRules';
-import { getTimeouts } from './timeouts';
 
 const TOKEN_KEY = 'deepseekContextSync.token';
-const GEMINI_KEY = 'gemini-key';
 
 function generateToken(): string {
     return crypto.randomBytes(24).toString('hex');
@@ -46,34 +41,6 @@ export async function activate(context: vscode.ExtensionContext) {
     const stateManager = new StateManager(workspaceRoot);
     await stateManager.initialize();
 
-    // ---------- Fase 3: Gemini ----------
-    const getCfg = () => vscode.workspace.getConfiguration('deepseekContextSync');
-    const getGeminiEnabled = () => getCfg().get<boolean>('geminiEnabled', false);
-    const getGeminiModel = () => getCfg().get<string>('geminiModel', 'gemini-2.0-flash');
-
-    const quota = new QuotaManager(
-        context.globalState,
-        () => getCfg().get<number>('geminiDailyBudget', 200),
-        msg => vscode.window.setStatusBarMessage(msg, 8000)
-    );
-
-    const gemini = new GeminiClient(
-        async () => {
-            try { return await context.secrets.get(GEMINI_KEY); }
-            catch { return undefined; }
-        },
-        getGeminiModel
-    );
-
-    const summarizer = new Summarizer(
-        indexer,
-        gemini,
-        quota,
-        getGeminiEnabled,
-        () => getTimeouts().gemini,
-        msg => vscode.window.setStatusBarMessage(msg, 6000)
-    );
-
     const applyManager = new ApplyManager(workspaceRoot);
     const taskRunner = new TaskRunner(workspaceRoot);
 
@@ -94,7 +61,6 @@ export async function activate(context: vscode.ExtensionContext) {
     wsServer.setApplyAbortHandler(() => applyManager.requestAbort());
     wsServer.setRunner(taskRunner);
     wsServer.setIndexer(indexer);
-    wsServer.setGemini({ quota, client: gemini, summarizer, isEnabled: getGeminiEnabled });
     wsServer.setStateManager(stateManager);
 
     const indexSub = contextManager.onDidChange(e => {
@@ -104,7 +70,6 @@ export async function activate(context: vscode.ExtensionContext) {
             if (content !== undefined) indexer.updateFile(e.relPath, content);
             else indexer.removeFile(e.relPath);
         }
-        summarizer.schedule();
     });
 
     const cfgSub = vscode.workspace.onDidChangeConfiguration(e => {
@@ -114,14 +79,7 @@ export async function activate(context: vscode.ExtensionContext) {
                     .get<boolean>('allowSensitiveFiles', false)
             );
         }
-        if (e.affectsConfiguration('deepseekContextSync.geminiEnabled')
-            || e.affectsConfiguration('deepseekContextSync.geminiModel')) {
-            if (getGeminiEnabled()) summarizer.schedule();
-            else summarizer.cancel();
-        }
     });
-
-    if (getGeminiEnabled()) summarizer.schedule();
 
     context.subscriptions.push(
         vscode.commands.registerCommand('deepseekContextSync.copyToken', async () => {
@@ -140,51 +98,6 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    context.subscriptions.push(
-        vscode.commands.registerCommand('deepseekContextSync.setGeminiKey', async () => {
-            const key = await vscode.window.showInputBox({
-                title: 'Chave da API do Gemini',
-                prompt: 'A chave será guardada no SecretStorage do VS Code (nunca em settings.json nem em log).',
-                password: true,
-                ignoreFocusOut: true,
-                placeHolder: 'AIza...',
-                validateInput: v => {
-                    const t = (v || '').trim();
-                    if (!t) return 'Cole a chave.';
-                    if (t.length < 20) return 'Chave parece curta demais.';
-                    if (/\s/.test(t)) return 'A chave não deve conter espaços.';
-                    return null;
-                }
-            });
-            if (!key) return;
-            await context.secrets.store(GEMINI_KEY, key.trim());
-            vscode.window.showInformationMessage(
-                '🔐 Chave do Gemini salva no SecretStorage. Ligue "deepseekContextSync.geminiEnabled" para usar.'
-            );
-            if (getGeminiEnabled()) summarizer.schedule();
-        })
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('deepseekContextSync.clearGeminiKey', async () => {
-            await context.secrets.delete(GEMINI_KEY);
-            vscode.window.showInformationMessage('🗑️ Chave do Gemini removida do SecretStorage.');
-        })
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('deepseekContextSync.runSummaries', async () => {
-            if (!getGeminiEnabled()) {
-                vscode.window.showWarningMessage(
-                    'Gemini está desligado. Ligue "deepseekContextSync.geminiEnabled" primeiro.'
-                );
-                return;
-            }
-            vscode.window.showInformationMessage('🤖 Gerando resumos com o Gemini em segundo plano...');
-            summarizer.schedule();
-        })
-    );
-
     vscode.window.setStatusBarMessage(
         'DeepSeek Context Sync: WS em 127.0.0.1:8765. Use "Copiar Token" para autorizar o navegador.',
         8000
@@ -194,7 +107,6 @@ export async function activate(context: vscode.ExtensionContext) {
         dispose: () => {
             cfgSub.dispose();
             indexSub.dispose();
-            summarizer.dispose();
             stateManager.dispose();
             indexer.dispose();
             contextManager.dispose();

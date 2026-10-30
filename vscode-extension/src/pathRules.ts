@@ -104,30 +104,6 @@ export function isSensitiveName(name: string): boolean {
     return looksSensitive(name);
 }
 
-/**
- * Filtro de sensibilidade usado EXCLUSIVAMENTE antes de enviar algo à API do
- * Gemini. Diferente de isSensitiveName(), este filtro vale SEMPRE, mesmo com
- * allowSensitiveFiles = true (que só libera o DeepSeek).
- *
- * Regras (conforme PLANO.md, Fase 0):
- *  - .env e .env.*
- *  - *.pem, *.key, *.p12, *.pfx, *.crt, *.cer
- *  - id_rsa*, id_ed25519*, id_ecdsa*
- *  - secrets.* e credentials.*
- *  - .npmrc, .pypirc, .netrc
- * Exceção: templates .env.example/.sample/.template/.dist são liberados.
- */
-export function isSensitiveForGemini(name: string): boolean {
-    if (isEnvExample(name)) return false;
-    const lower = name.toLowerCase();
-    if (lower === '.env' || lower.startsWith('.env.')) return true;
-    if (SENSITIVE_NAMES.has(lower)) return true;
-    if (/^id_(rsa|ed25519|ecdsa)/.test(lower)) return true;
-    if (/^secrets?\./.test(lower)) return true;
-    if (/^credentials?\./.test(lower)) return true;
-    return SENSITIVE_EXTENSIONS.has(path.posix.extname(lower));
-}
-
 /** rel: caminho relativo com "/" (ex.: "src/main.py"). Usado para CONTEXTO (leitura). */
 export function isExcludedPath(rel: string): boolean {
     const parts = rel.split('/');

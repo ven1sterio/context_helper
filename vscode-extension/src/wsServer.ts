@@ -6,11 +6,8 @@ import { ApplyResult } from './applyPlan';
 import { TaskRunner } from './taskRunner';
 import { Indexer } from './indexer';
 import { StateManager, StateUpdate } from './stateManager';
-import { selectFiles, buildSelectiveContext, mergeWithGemini, ScoredFile } from './selector';
+import { selectFiles, buildSelectiveContext, ScoredFile } from './selector';
 import { getTimeouts, timeoutsPayload, ALLOWED_TIMEOUTS } from './timeouts';
-import { QuotaManager } from './quota';
-import { GeminiClient } from './geminiClient';
-import { Summarizer } from './summarizer';
 
 export interface ApplyOptions {
     auto?: boolean;
@@ -18,28 +15,13 @@ export interface ApplyOptions {
 
 export type ApplyHandler = (files: unknown, options?: ApplyOptions) => Promise<ApplyResult>;
 
-interface GeminiBundle {
-    quota: QuotaManager;
-    client: GeminiClient;
-    summarizer: Summarizer;
-    isEnabled: () => boolean;
-}
-
 export interface WsServerOptions {
     port?: number;
     token: string;
     onError?: (err: Error) => void;
 }
 
-interface GeminiRouteItem {
-    path: string;
-    reason?: string;
-}
-
-interface GeminiRouteResponse {
-    files?: GeminiRouteItem[];
-    reason?: string;
-}
+const ALLOWED_ORIGINS = ['https://chat.deepseek.com', 'https://gemini.google.com'];
 
 export class WsServer {
     private wss: WebSocketServer;
@@ -48,7 +30,6 @@ export class WsServer {
     private applyAbortHandler?: () => void;
     private runner?: TaskRunner;
     private indexer?: Indexer;
-    private gemini?: GeminiBundle;
     private stateManager?: StateManager;
     private abortRequested = false;
     private configSub: vscode.Disposable | null = null;
@@ -75,7 +56,7 @@ export class WsServer {
                 }
                 const origin = (info.origin || (info.req.headers.origin as string | undefined) || '').trim();
                 if (!origin) { cb(true); return; }
-                if (origin === 'https://chat.deepseek.com' || origin.startsWith('chrome-extension://')) {
+                if (ALLOWED_ORIGINS.includes(origin) || origin.startsWith('chrome-extension://')) {
                     cb(true); return;
                 }
                 options.onError?.(new Error(`origem recusada: ${origin}`));
@@ -87,8 +68,7 @@ export class WsServer {
         this.configSub = vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('deepseekContextSync.responseTimeout')
                 || e.affectsConfiguration('deepseekContextSync.runTimeout')
-                || e.affectsConfiguration('deepseekContextSync.runTimeoutSec')
-                || e.affectsConfiguration('deepseekContextSync.geminiTimeout')) {
+                || e.affectsConfiguration('deepseekContextSync.runTimeoutSec')) {
                 this.broadcastConfig();
             }
         });
@@ -120,7 +100,6 @@ export class WsServer {
                     this.abortRequested = true;
                     try { this.applyAbortHandler?.(); } catch { /* ignore */ }
                     try { this.runner?.cancel(); } catch { /* ignore */ }
-                    try { this.gemini?.summarizer.cancel(); } catch { /* ignore */ }
                     send({ type: 'aborted', ok: true });
                     return;
                 }
@@ -135,12 +114,11 @@ export class WsServer {
                     const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
                     const map: Record<string, string> = {
                         response: 'responseTimeout',
-                        run: 'runTimeout',
-                        gemini: 'geminiTimeout'
+                        run: 'runTimeout'
                     };
                     let targets: string[];
                     if (which === 'agent') targets = ['response', 'run'];
-                    else if (which === 'all') targets = ['response', 'run', 'gemini'];
+                    else if (which === 'all') targets = ['response', 'run'];
                     else if (which in map) targets = [which];
                     else { send({ type: 'error', message: `Timeout desconhecido: ${which}` }); return; }
                     try {
@@ -180,28 +158,12 @@ export class WsServer {
                     return;
                 }
 
-                if (msg.type === 'geminiStatus') {
-                    if (!this.gemini) { send({ type: 'geminiStatus', enabled: false }); return; }
-                    send({ type: 'geminiStatus', enabled: this.gemini.isEnabled(), quota: this.gemini.quota.getStatus() });
-                    return;
-                }
-
-                if (msg.type === 'runSummaries') {
-                    if (!this.gemini || !this.gemini.isEnabled()) {
-                        send({ type: 'error', message: 'Gemini está desligado.' });
-                        return;
-                    }
-                    this.gemini.summarizer.schedule();
-                    send({ type: 'summariesStarted', ok: true });
-                    return;
-                }
-
                 if (msg.type === 'selectContext') {
                     if (!this.indexer) { send({ type: 'selection', error: 'Índice não disponível.' }); return; }
                     const request = String(msg.request || '').trim();
                     if (!request) { send({ type: 'selection', error: 'Digite o pedido antes de usar o seletivo.' }); return; }
                     try {
-                        const selected = await this.selectWithOptionalGemini(request);
+                        const selected = this.selectLocal(request);
                         if (selected.length === 0) {
                             send({ type: 'selection', files: [], total: 0, request, error: 'Nenhum arquivo corresponde ao pedido.' });
                             return;
@@ -214,7 +176,7 @@ export class WsServer {
                             total += tokens;
                             return { path: f.path, score: Math.round(f.score * 10) / 10, tokens, reasons: f.reasons.slice(0, 3) };
                         });
-                        send({ type: 'selection', files, total, request, gemini: this.gemini?.isEnabled() ? true : false });
+                        send({ type: 'selection', files, total, request });
                     } catch (e) {
                         send({ type: 'selection', error: 'Falha ao selecionar: ' + (e instanceof Error ? e.message : String(e)) });
                     }
@@ -309,75 +271,9 @@ export class WsServer {
         });
     }
 
-    private async selectWithOptionalGemini(request: string): Promise<ScoredFile[]> {
+    private selectLocal(request: string): ScoredFile[] {
         if (!this.indexer) return [];
-        const index = this.indexer.getIndex();
-        const local = selectFiles(request, index, 25);
-
-        if (!this.gemini || !this.gemini.isEnabled()) return local;
-        if (!this.gemini.quota.canCallNow()) {
-            const ok = await this.gemini.quota.acquire();
-            if (!ok) return local;
-        } else {
-            await this.gemini.quota.acquire();
-        }
-
-        try {
-            const route = await this.gemini.client.callJson<GeminiRouteResponse>({
-                system:
-                    'Você é um roteador de arquivos de projeto. Recebe um pedido em linguagem natural e ' +
-                    'uma lista de arquivos (com resumos e símbolos) e devolve JSON: {"files":[{"path":"...","reason":"..."}]}. ' +
-                    'Escolha de 3 a 15 arquivos realmente relevantes. NÃO inclua explicação fora do JSON.',
-                prompt: this.buildRoutePrompt(request, local),
-                timeoutSec: getTimeouts().gemini
-            });
-            if (!route.ok) {
-                if (route.error === 'rate-limit') {
-                    const canRetry = await this.gemini.quota.backoff();
-                    if (!canRetry) return local;
-                    const retry = await this.gemini.client.callJson<GeminiRouteResponse>({
-                        system: 'Responda só JSON: {"files":[{"path":"...","reason":"..."}]}.',
-                        prompt: this.buildRoutePrompt(request, local),
-                        timeoutSec: getTimeouts().gemini
-                    });
-                    if (!retry.ok) return local;
-                    return this.combine(local, retry.data);
-                }
-                return local;
-            }
-            return this.combine(local, route.data);
-        } catch { return local; }
-    }
-
-    private combine(local: ScoredFile[], gemini: GeminiRouteResponse): ScoredFile[] {
-        if (!this.indexer) return local;
-        const items: GeminiRouteItem[] = Array.isArray(gemini?.files)
-            ? gemini.files.filter(x => x && typeof x.path === 'string') : [];
-        if (items.length === 0) return local;
-        return mergeWithGemini(local, items, this.indexer.getIndex(), 25);
-    }
-
-    private buildRoutePrompt(request: string, local: ScoredFile[]): string {
-        if (!this.indexer) return '';
-        const idx = this.indexer.getIndex();
-        const candidates = new Set<string>(local.map(l => l.path));
-        const allEntries = Object.entries(idx.files).sort((a, b) => a[1].tokens - b[1].tokens).slice(0, 120);
-        for (const [rel] of allEntries) candidates.add(rel);
-
-        const lines: string[] = [];
-        lines.push(`Pedido: ${request}`);
-        lines.push('');
-        lines.push('Arquivos disponíveis (path | tokens | resumo | símbolos):');
-        for (const rel of [...candidates].sort()) {
-            const e = idx.files[rel];
-            if (!e) continue;
-            const summary = (e.summary || '').slice(0, 120) || '(sem resumo)';
-            const syms = e.symbols.slice(0, 5).map(s => s.name).join(', ');
-            lines.push(`- ${rel} | ${e.tokens}t | ${summary} | ${syms}`);
-        }
-        lines.push('');
-        lines.push('Devolva {"files":[{"path":"...","reason":"..."}]} com até 15 caminhos.');
-        return lines.join('\n');
+        return selectFiles(request, this.indexer.getIndex(), 25);
     }
 
     private broadcastConfig(): void {
@@ -391,7 +287,6 @@ export class WsServer {
     setApplyAbortHandler(handler: () => void) { this.applyAbortHandler = handler; }
     setRunner(runner: TaskRunner) { this.runner = runner; }
     setIndexer(indexer: Indexer) { this.indexer = indexer; }
-    setGemini(bundle: GeminiBundle) { this.gemini = bundle; }
     setStateManager(mgr: StateManager) { this.stateManager = mgr; }
     getToken(): string { return this.token; }
 

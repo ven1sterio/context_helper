@@ -1,4 +1,4 @@
-// Montagem do prompt enviado ao DeepSeek.
+// Montagem do prompt enviado ao chat (DeepSeek ou Gemini).
 // Contrato: "### FILE:" com o arquivo COMPLETO ou "EDIT:" com SEARCH/REPLACE.
 
 const FENCE = '`'.repeat(3);

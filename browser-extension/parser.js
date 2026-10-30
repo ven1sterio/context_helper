@@ -200,7 +200,7 @@ function findViolations(item) {
 function parseLastResponse() {
     const container = findLastAssistantMessage();
     if (!container) {
-        return { error: 'Não encontrei a última resposta na página (o site pode ter mudado; ajuste ASSISTANT_SELECTORS em providers/deepseek.js).' };
+        return { error: 'Não encontrei a última resposta na página (o site pode ter mudado; ajuste ASSISTANT_SELECTORS em providers/deepseek.js ou providers/gemini.js).' };
     }
 
     let found = parseItemsFromContainer(container);

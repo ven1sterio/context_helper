@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "DeepSeek Context Bridge",
-  "version": "1.4",
-  "description": "Conecta o chat do DeepSeek ao contexto local do VS Code.",
+  "name": "Context Sync Bridge (DeepSeek + Gemini)",
+  "version": "1.5",
+  "description": "Conecta o chat web do DeepSeek ou do Gemini ao contexto local do VS Code (sem API).",
   "permissions": [
     "storage"
   ],
   "host_permissions": [
     "https://chat.deepseek.com/*",
+    "https://gemini.google.com/*",
     "http://127.0.0.1:8765/*"
   ],
   "content_scripts": [
@@ -17,6 +18,18 @@
       ],
       "js": [
         "providers/deepseek.js",
+        "prompt.js",
+        "parser.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "providers/gemini.js",
         "prompt.js",
         "parser.js",
         "content.js"

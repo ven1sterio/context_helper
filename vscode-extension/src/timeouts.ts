@@ -5,8 +5,6 @@ export interface Timeouts {
     response: number;
     /** Tempo máximo de um comando de build/teste (segundos). */
     run: number;
-    /** Tempo máximo de uma chamada à API do Gemini (segundos). */
-    gemini: number;
     /** Tempo máximo aguardando o VS Code aplicar+rodar no navegador (segundos). */
     apply: number;
 }
@@ -15,7 +13,6 @@ export const ALLOWED_TIMEOUTS: ReadonlyArray<number> = [60, 300, 600];
 
 const DEFAULT_RESPONSE = 600;
 const DEFAULT_RUN = 600;
-const DEFAULT_GEMINI = 60;
 const APPLY_OVERHEAD = 180;
 
 /** Valor EXPLICITAMENTE configurado pelo usuário (global/workspace/folder). */
@@ -46,11 +43,6 @@ export function getTimeouts(): Timeouts {
         DEFAULT_RESPONSE
     );
 
-    const gemini = clamp(
-        getExplicit(cfg, 'geminiTimeout'),
-        DEFAULT_GEMINI
-    );
-
     let run: number;
     const explicitRun = getExplicit(cfg, 'runTimeout');
     if (explicitRun !== undefined) {
@@ -63,13 +55,12 @@ export function getTimeouts(): Timeouts {
     return {
         response,
         run,
-        gemini,
         apply: run + APPLY_OVERHEAD
     };
 }
 
 /** Payload no formato que o navegador espera na mensagem `config`. */
-export function timeoutsPayload(): { response: number; run: number; apply: number; gemini: number } {
+export function timeoutsPayload(): { response: number; run: number; apply: number } {
     const t = getTimeouts();
-    return { response: t.response, run: t.run, apply: t.apply, gemini: t.gemini };
+    return { response: t.response, run: t.run, apply: t.apply };
 }

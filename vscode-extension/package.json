@@ -1,8 +1,8 @@
 {
   "name": "deepseek-context-sync",
   "displayName": "DeepSeek Context Sync",
-  "description": "Sincroniza o contexto do projeto com o chat web do DeepSeek, com opção de agente autônomo (Full Code).",
-  "version": "0.4.0",
+  "description": "Sincroniza o contexto do projeto com o chat web do DeepSeek ou do Gemini (via página, sem API), com opção de agente autônomo (Full Code).",
+  "version": "0.5.0",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -12,11 +12,14 @@
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      { "command": "deepseekContextSync.copyToken", "title": "DeepSeek Context Sync: Copiar Token" },
-      { "command": "deepseekContextSync.showToken", "title": "DeepSeek Context Sync: Mostrar Token" },
-      { "command": "deepseekContextSync.setGeminiKey", "title": "DeepSeek Context Sync: Configurar Chave do Gemini" },
-      { "command": "deepseekContextSync.clearGeminiKey", "title": "DeepSeek Context Sync: Limpar Chave do Gemini" },
-      { "command": "deepseekContextSync.runSummaries", "title": "DeepSeek Context Sync: Gerar Resumos com o Gemini agora" }
+      {
+        "command": "deepseekContextSync.copyToken",
+        "title": "DeepSeek Context Sync: Copiar Token"
+      },
+      {
+        "command": "deepseekContextSync.showToken",
+        "title": "DeepSeek Context Sync: Mostrar Token"
+      }
     ],
     "configuration": {
       "title": "DeepSeek Context Sync",
@@ -43,24 +46,33 @@
         },
         "deepseekContextSync.responseTimeout": {
           "type": "number",
-          "enum": [60, 300, 600],
-          "enumDescriptions": ["1 minuto", "5 minutos", "10 minutos"],
+          "enum": [
+            60,
+            300,
+            600
+          ],
+          "enumDescriptions": [
+            "1 minuto",
+            "5 minutos",
+            "10 minutos"
+          ],
           "default": 600,
-          "description": "Tempo máximo aguardando a resposta do DeepSeek."
+          "description": "Tempo máximo aguardando a resposta do chat (DeepSeek ou Gemini)."
         },
         "deepseekContextSync.runTimeout": {
           "type": "number",
-          "enum": [60, 300, 600],
-          "enumDescriptions": ["1 minuto", "5 minutos", "10 minutos"],
+          "enum": [
+            60,
+            300,
+            600
+          ],
+          "enumDescriptions": [
+            "1 minuto",
+            "5 minutos",
+            "10 minutos"
+          ],
           "default": 600,
           "description": "Tempo máximo de um comando de build/teste no Full Code."
-        },
-        "deepseekContextSync.geminiTimeout": {
-          "type": "number",
-          "enum": [60, 300, 600],
-          "enumDescriptions": ["1 minuto", "5 minutos", "10 minutos"],
-          "default": 60,
-          "description": "Tempo máximo de cada chamada à API do Gemini."
         },
         "deepseekContextSync.runTimeoutSec": {
           "type": "number",
@@ -70,27 +82,12 @@
         "deepseekContextSync.allowSensitiveFiles": {
           "type": "boolean",
           "default": false,
-          "description": "Se ligado, .env, chaves e credenciais NÃO são bloqueados. A API do Gemini NUNCA recebe esses arquivos, independentemente desta opção."
+          "description": "Se ligado, .env, chaves e credenciais NÃO são bloqueados no contexto enviado ao chat."
         },
         "deepseekContextSync.runInTerminal": {
           "type": "boolean",
           "default": true,
           "description": "Executa o build/teste no terminal integrado do VS Code."
-        },
-        "deepseekContextSync.geminiEnabled": {
-          "type": "boolean",
-          "default": false,
-          "description": "Ativa o uso opcional do Gemini para resumos, tags e roteamento. A chave fica no SecretStorage."
-        },
-        "deepseekContextSync.geminiModel": {
-          "type": "string",
-          "default": "gemini-2.0-flash",
-          "description": "Modelo do Gemini para resumos e roteamento."
-        },
-        "deepseekContextSync.geminiDailyBudget": {
-          "type": "number",
-          "default": 200,
-          "description": "Máximo de requisições ao Gemini por dia (fuso Pacífico)."
         }
       }
     }
