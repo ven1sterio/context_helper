@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Context Sync Bridge (DeepSeek + Gemini)",
-  "version": "1.5",
+  "version": "1.6",
   "description": "Conecta o chat web do DeepSeek ou do Gemini ao contexto local do VS Code (sem API).",
   "permissions": [
     "storage"

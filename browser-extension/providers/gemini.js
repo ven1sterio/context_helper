@@ -109,6 +109,17 @@
         constructor() {
             this.name = 'Gemini';
             this.newChatUrl = 'https://gemini.google.com/app';
+            // Acima disso o contexto vai como ARQUIVO anexo: colar centenas de KB
+            // no editor Quill (Angular) congela a aba.
+            this.maxInlineChars = 40000;
+            this.supportsFileAttach = true;
+        }
+
+        /** Campo vazio? Usa textContent (barato) em vez de innerText (força layout). */
+        isInputEmpty(input) {
+            if (!input) return true;
+            if (input.tagName === 'TEXTAREA') return input.value.trim().length === 0;
+            return (input.textContent || '').replace(/[\u200B\s]/g, '').length === 0;
         }
 
         findInput() {
@@ -153,7 +164,8 @@
 
             // 2) Confere se entrou; senão tenta insertText.
             const expected = text.replace(/\s+/g, '').length;
-            const got = () => this.readInput(input).replace(/\s+/g, '').length;
+            // textContent não força layout; innerText em 100s de KB trava a aba.
+            const got = () => (input.textContent || '').replace(/\s+/g, '').length;
             if (!pasted || got() < expected * 0.9) {
                 try {
                     document.execCommand('selectAll', false, null);
@@ -178,19 +190,104 @@
             try { input.scrollTop = input.scrollHeight; } catch { /* ignore */ }
         }
 
+        /** Cola texto grande em pedaços, devolvendo o controle à página entre eles. */
+        async setInputChunked(input, text, onProgress) {
+            if (!input) return false;
+            if (input.tagName === 'TEXTAREA') { this.setInput(input, text); return true; }
+            input.focus();
+            try { document.execCommand('selectAll', false, null); } catch { /* ignore */ }
+            try { document.execCommand('delete', false, null); } catch { /* ignore */ }
+            await sleep(50);
+
+            const CHUNK = 12000;
+            let pos = 0;
+            while (pos < text.length) {
+                let end = Math.min(text.length, pos + CHUNK);
+                if (end < text.length) {
+                    const nl = text.lastIndexOf('\n', end);
+                    if (nl > pos + CHUNK / 2) end = nl + 1;
+                }
+                const piece = text.slice(pos, end);
+                try {
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', piece);
+                    input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                } catch {
+                    try { document.execCommand('insertText', false, piece); } catch { /* ignore */ }
+                }
+                pos = end;
+                if (onProgress) onProgress(Math.min(100, Math.round(pos / text.length * 100)));
+                await sleep(40);
+            }
+            const expected = text.replace(/\s+/g, '').length;
+            const got = (input.textContent || '').replace(/\s+/g, '').length;
+            return got >= expected * 0.9;
+        }
+
+        /** Há um chip de anexo mostrando esse nome de arquivo? */
+        hasAttachmentChip(name) {
+            const nodes = document.querySelectorAll(
+                'uploader-file-preview-container, uploader-file-preview, file-preview, ' +
+                '[class*="preview" i], [class*="upload" i], [class*="attachment" i]'
+            );
+            for (const n of nodes) if ((n.textContent || '').includes(name)) return true;
+            return false;
+        }
+
+        /**
+         * Anexa `text` como arquivo .txt (cola um File no editor; se o Gemini
+         * ignorar, tenta um "drop"). Devolve true só se o chip aparecer.
+         */
+        async attachTextFile(input, text, filename) {
+            if (!input) return false;
+            let file;
+            try { file = new File([text], filename, { type: 'text/plain' }); } catch { return false; }
+
+            const waitChip = async (ms) => {
+                const end = Date.now() + ms;
+                while (Date.now() < end) {
+                    if (this.hasAttachmentChip(filename)) return true;
+                    await sleep(250);
+                }
+                return false;
+            };
+
+            // 1) paste com File
+            try {
+                input.focus();
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                if (await waitChip(6000)) return true;
+            } catch { /* tenta o drop */ }
+
+            // 2) drop sobre a área de entrada
+            try {
+                const target = input.closest('rich-textarea') || input.parentElement || input;
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                for (const type of ['dragenter', 'dragover', 'drop']) {
+                    target.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+                }
+                if (await waitChip(6000)) return true;
+            } catch { /* ignore */ }
+            return false;
+        }
+
         findSendButton() {
             return firstVisible(SEND_SELECTORS);
         }
 
-        async pressSend() {
+        async pressSend(waitMs) {
             const input = this.findInput();
             if (!input) return false;
             input.focus();
             await sleep(150);
 
-            // Após colar texto grande o botão pode demorar para habilitar.
+            // Após colar texto grande (ou anexar arquivo) o botão demora para habilitar.
+            const tries = Math.max(40, Math.ceil((waitMs || 6000) / 150));
             let btn = null;
-            for (let i = 0; i < 40; i++) {
+            for (let i = 0; i < tries; i++) {
                 btn = this.findSendButton();
                 if (btn && !isDisabled(btn)) break;
                 btn = null;
@@ -208,9 +305,9 @@
             }
 
             // Sucesso = campo esvaziou OU a geração começou (botão virou "parar").
-            for (let i = 0; i < 20; i++) {
+            for (let i = 0; i < 40; i++) {
                 await sleep(150);
-                if (this.readInput(input).trim().length === 0) return true;
+                if (this.isInputEmpty(input)) return true;
                 if (this.findStopButton()) return true;
             }
             return false;

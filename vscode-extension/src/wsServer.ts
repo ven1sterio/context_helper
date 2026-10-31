@@ -273,7 +273,7 @@ export class WsServer {
 
     private selectLocal(request: string): ScoredFile[] {
         if (!this.indexer) return [];
-        return selectFiles(request, this.indexer.getIndex(), 40);
+        return selectFiles(request, this.indexer.getIndex(), 40, this.contextManager.getAllFiles());
     }
 
     private broadcastConfig(): void {

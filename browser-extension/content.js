@@ -68,6 +68,10 @@ let selCancelBtn = null;
 let selectionState = null;
 
 let fullCodeMode = false;
+let instantMode = false;      // ⚡ sem esperas artificiais entre envios
+let selectReview = false;      // 🎯 mostrar lista para revisar antes de colar
+let instantBtn = null;
+let reviewBtn = null;
 let agentRunning = false;
 let agentIteration = 0;
 let agentPaused = false;
@@ -93,11 +97,13 @@ const HUMAN_DELAY = {
 };
 
 function humanDelay(range) {
+    if (instantMode) return sleep(range === HUMAN_DELAY.afterSendFailed ? 5000 : 150);
     const [min, max] = range;
     return sleep(Math.round(min + Math.random() * (max - min)));
 }
 
 async function waitBetweenResends() {
+    if (instantMode) return;   // ⚡ Instantâneo: pula o cooldown anti-spam
     const [min, max] = HUMAN_DELAY.betweenResends;
     const totalMs = Math.round(min + Math.random() * (max - min));
     const endAt = Date.now() + totalMs;
@@ -116,6 +122,18 @@ async function loadToken() {
         const r = await chrome.storage.local.get(['vscodeToken']);
         authToken = (r && r.vscodeToken) || '';
     } catch { authToken = ''; }
+}
+
+async function loadPrefs() {
+    try {
+        const r = await chrome.storage.local.get(['instantMode', 'selectReview']);
+        instantMode = !!(r && r.instantMode);
+        selectReview = !!(r && r.selectReview);
+    } catch { /* ignore */ }
+}
+
+function savePref(key, value) {
+    try { chrome.storage.local.set({ [key]: value }); } catch { /* ignore */ }
 }
 
 async function saveToken(t) {
@@ -298,7 +316,57 @@ function getProvider() {
 function findInput() { return getProvider().findInput(); }
 function readInput(input) { return getProvider().readInput(input); }
 function setInput(input, text) { return getProvider().setInput(input, text); }
-async function pressSend() { return getProvider().pressSend(); }
+async function pressSend(waitMs) { return getProvider().pressSend(waitMs); }
+
+// ---------- Montagem e entrega do prompt ----------
+
+const ATTACH_NOTE = '(O conteúdo dos arquivos está no ANEXO "contexto-projeto.txt" desta mensagem. ' +
+    'Leia-o inteiro antes de responder; os caminhos e o formato das respostas seguem as regras acima.)';
+
+/**
+ * Monta o prompt. Se o provider aceita anexo e o contexto é grande, o contexto
+ * vira um arquivo (fileText) e o texto do campo fica curto — colar centenas de KB
+ * no editor do Gemini congela a aba.
+ */
+function composePrompt(kind, { tree, data, question, fullCode }) {
+    const p = getProvider();
+    const build = (ctx) => kind === 'full'
+        ? buildFullPrompt({ tree, context: ctx, question, fullCode })
+        : buildDeltaPrompt({ tree, changes: ctx, question, fullCode });
+    const asFile = !!(p.supportsFileAttach && p.attachTextFile && data && data.length > (p.maxInlineChars || Infinity));
+    return {
+        text: build(asFile ? ATTACH_NOTE : data),
+        fileText: asFile ? ('[CONTEXTO ATUAL DOS ARQUIVOS]\n' + data) : null,
+        inline: () => build(data)
+    };
+}
+
+async function setInputBig(input, text) {
+    const p = getProvider();
+    if (p.setInputChunked && text.length > (p.maxInlineChars || 40000)) {
+        const ok = await p.setInputChunked(input, text, (pct) => toast(`⌨️ Colando no campo… ${pct}%`));
+        if (!ok) toast('⚠️ O campo pode ter recebido só parte do texto. Confira antes de enviar.');
+        return;
+    }
+    p.setInput(input, text);
+}
+
+/** Coloca o prompt no campo. Devolve { attached } (true = contexto foi como arquivo). */
+async function deliverPrompt(input, composed) {
+    const p = getProvider();
+    if (composed.fileText) {
+        toast('📎 Anexando o contexto como arquivo (evita travar o ' + siteName() + ')...');
+        p.setInput(input, composed.text);
+        await sleep(250);
+        const ok = await p.attachTextFile(input, composed.fileText, 'contexto-projeto.txt');
+        if (ok) return { attached: true };
+        toast('⚠️ Não consegui anexar o arquivo. Colando o texto em partes...');
+        await setInputBig(input, composed.inline());
+        return { attached: false };
+    }
+    await setInputBig(input, composed.text);
+    return { attached: false };
+}
 
 // ---------- Anexar contexto ----------
 
@@ -323,13 +391,13 @@ async function handleAttach(mode) {
     const kb = (msg.chars / 1024).toFixed(1);
 
     if (msg.mode === 'full') {
-        setInput(input, buildFullPrompt({ tree: msg.tree, context: msg.data, question, fullCode: false }));
+        await deliverPrompt(input, composePrompt('full', { tree: msg.tree, data: msg.data, question, fullCode: false }));
         nextIsDelta = true;
         let info = `Contexto completo: ${msg.files} arquivo(s), ${kb} KB.`;
         if (msg.omitted > 0) info += ` ${msg.omitted} omitido(s) por limite de tamanho.`;
         toast(info);
     } else {
-        setInput(input, buildDeltaPrompt({ tree: msg.tree, changes: msg.data, question, fullCode: false }));
+        await deliverPrompt(input, composePrompt('delta', { tree: msg.tree, data: msg.data, question, fullCode: false }));
         let info = `Alterações: ${msg.files} arquivo(s), ${kb} KB.`;
         if (msg.tree) info += ' Estrutura atualizada.';
         if (msg.remaining > 0) info += ` Restam ${msg.remaining}; clique de novo para enviar.`;
@@ -379,7 +447,11 @@ async function handleSelectContext() {
     if (res.error) { toast('⚠️ ' + res.error); return; }
     if (!res.files || res.files.length === 0) { toast('Nenhum arquivo corresponde ao pedido.'); return; }
 
-    showSelection(res.files, res.total, question);
+    if (selectReview) { showSelection(res.files, res.total, question); return; }
+
+    // Padrão: seleciona e COLA o conteúdo de uma vez (sem etapa extra).
+    selectionState = { files: res.files, total: res.total, request: question };
+    await buildAndPasteSelection(res.files.map(f => f.path), question);
 }
 
 function showSelection(files, total, request) {
@@ -444,15 +516,25 @@ async function applySelection() {
     if (paths.length === 0) { toast('Selecione pelo menos um arquivo.'); return; }
 
     if (selApplyBtn) { selApplyBtn.disabled = true; selApplyBtn.textContent = '⏳ Montando...'; }
+    const question = (selectionState && selectionState.request) || '';
+    await buildAndPasteSelection(paths, question);
+}
+
+async function buildAndPasteSelection(paths, question) {
+    toast(`📦 Lendo ${paths.length} arquivo(s)...`);
     const res = await requestSelection('buildSelection', { paths });
     if (!res) { toast('Sem resposta do VS Code.'); updateSelHeader(); return; }
     if (res.error) { toast('⚠️ ' + res.error); updateSelHeader(); return; }
+    if (!res.data || !res.data.trim() || (res.files || 0) === 0) {
+        toast('⚠️ Os arquivos escolhidos não têm conteúdo no VS Code (grandes demais, binários ou excluídos). Ajuste o pedido.');
+        updateSelHeader();
+        return;
+    }
 
     const input = findInput();
     if (!input) { toast('Campo de entrada perdido.'); updateSelHeader(); return; }
 
-    const question = (selectionState && selectionState.request) || '';
-    setInput(input, buildFullPrompt({ tree: res.tree, context: res.data, question, fullCode: false }));
+    await deliverPrompt(input, composePrompt('full', { tree: res.tree, data: res.data, question, fullCode: false }));
     nextIsDelta = true;
 
     const kTokens = ((res.tokens || 0) / 1000).toFixed(1);
@@ -661,16 +743,17 @@ async function agentLoop(initialQuestion) {
         }
 
         let textToSend = promptText;
+        let composed = null;
         if (needContext) {
             const msg = await requestContext('auto');
             if (!msg) { toast('VS Code não respondeu ao pedido de contexto.'); return; }
             if (msg.mode === 'empty') {
                 textToSend = buildDeltaPrompt({ tree: undefined, changes: '', question: promptText, fullCode: true });
             } else if (msg.mode === 'full') {
-                textToSend = buildFullPrompt({ tree: msg.tree, context: msg.data, question: promptText, fullCode: true });
+                composed = composePrompt('full', { tree: msg.tree, data: msg.data, question: promptText, fullCode: true });
                 nextIsDelta = true;
             } else {
-                textToSend = buildDeltaPrompt({ tree: msg.tree, changes: msg.data, question: promptText, fullCode: true });
+                composed = composePrompt('delta', { tree: msg.tree, data: msg.data, question: promptText, fullCode: true });
             }
             needContext = false;
         }
@@ -680,10 +763,12 @@ async function agentLoop(initialQuestion) {
         await humanDelay(HUMAN_DELAY.beforeSend);
 
         const baseline = snapshotAssistant();
-        setInput(input, textToSend);
+        let attached = false;
+        if (composed) attached = (await deliverPrompt(input, composed)).attached;
+        else await setInputBig(input, textToSend);
         await sleep(150);
 
-        const sent = await pressSend();
+        const sent = await pressSend(attached ? 60000 : 6000);
         if (!sent) {
             toast('⚠️ Envio falhou (possível limite de requisições do site). Aguardando...');
             await humanDelay(HUMAN_DELAY.afterSendFailed);
@@ -965,6 +1050,17 @@ function updateUI() {
         fullCodeToggle.textContent = fullCodeMode ? '🔁 Full Code ✓' : '🔁 Full Code';
     }
 
+    if (instantBtn) {
+        instantBtn.classList.toggle('ds-warning', instantMode);
+        instantBtn.classList.toggle('ds-ghost', !instantMode);
+        instantBtn.textContent = instantMode ? '⚡ Instantâneo ✓' : '⚡ Instantâneo';
+    }
+    if (reviewBtn) {
+        reviewBtn.classList.toggle('ds-success', selectReview);
+        reviewBtn.classList.toggle('ds-ghost', !selectReview);
+        reviewBtn.textContent = selectReview ? '📋 Revisar ✓' : '📋 Revisar';
+    }
+
     if (attachBtn) {
         attachBtn.classList.remove('ds-primary', 'ds-warning', 'ds-danger');
         if (agentRunning) {
@@ -1030,6 +1126,32 @@ function addUI() {
     statusLabelEl = document.createElement('span');
     statusLabelEl.textContent = siteName() + ' Sync';
     statusRow.append(statusDot, statusLabelEl);
+
+    instantBtn = document.createElement('button');
+    instantBtn.type = 'button';
+    instantBtn.className = 'ds-btn ds-ghost';
+    instantBtn.textContent = '⚡ Instantâneo';
+    instantBtn.title = 'Full Code sem cooldown: pula as esperas anti-spam entre envios (risco de o site limitar requisições).';
+    instantBtn.onclick = () => {
+        instantMode = !instantMode;
+        savePref('instantMode', instantMode);
+        updateUI();
+        toast(instantMode
+            ? '⚡ Instantâneo ATIVO: sem cooldown entre iterações. Se o site limitar, desligue.'
+            : '🕒 Instantâneo desligado: cooldown anti-spam de ~1 min entre envios.');
+    };
+
+    reviewBtn = document.createElement('button');
+    reviewBtn.type = 'button';
+    reviewBtn.className = 'ds-btn ds-ghost';
+    reviewBtn.textContent = '📋 Revisar';
+    reviewBtn.title = 'Seletivo: mostrar a lista de arquivos para marcar/desmarcar antes de colar. Desligado = cola direto.';
+    reviewBtn.onclick = () => {
+        selectReview = !selectReview;
+        savePref('selectReview', selectReview);
+        updateUI();
+        toast(selectReview ? '📋 Seletivo vai mostrar a lista antes de colar.' : '🎯 Seletivo cola o conteúdo direto.');
+    };
 
     fullCodeToggle = document.createElement('button');
     fullCodeToggle.type = 'button';
@@ -1131,9 +1253,9 @@ function addUI() {
     selActions.append(selApplyBtn, selCancelBtn);
     selPanel.append(selHeaderEl, selListEl, selActions);
 
-    const row1 = document.createElement('div'); row1.className = 'ds-row'; row1.append(fullCodeToggle);
+    const row1 = document.createElement('div'); row1.className = 'ds-row'; row1.append(fullCodeToggle, instantBtn);
     const row2 = document.createElement('div'); row2.className = 'ds-row'; row2.append(fullBtn, applyBtn);
-    const row3 = document.createElement('div'); row3.className = 'ds-row'; row3.append(selectBtn, timeoutSelect);
+    const row3 = document.createElement('div'); row3.className = 'ds-row'; row3.append(selectBtn, reviewBtn, timeoutSelect);
     const row4 = document.createElement('div'); row4.className = 'ds-row'; row4.append(attachBtn);
     const rowPause = document.createElement('div'); rowPause.className = 'ds-row'; rowPause.append(moreBtn);
     const row5 = document.createElement('div'); row5.className = 'ds-row'; row5.append(newConvBtn);
@@ -1186,6 +1308,7 @@ async function handlePendingPrompt() {
 
 async function bootstrap() {
     await loadToken();
+    await loadPrefs();
     updateUI();
     connect();
     handlePendingPrompt();
