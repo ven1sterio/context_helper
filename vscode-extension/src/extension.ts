@@ -5,6 +5,7 @@ import { ApplyManager } from './applyManager';
 import { WsServer } from './wsServer';
 import { TaskRunner } from './taskRunner';
 import { Indexer } from './indexer';
+import { GraphStore } from './graphStore';
 import { StateManager } from './stateManager';
 import { setAllowSensitive, maskSecrets } from './pathRules';
 
@@ -61,6 +62,11 @@ export async function activate(context: vscode.ExtensionContext) {
     wsServer.setApplyAbortHandler(() => applyManager.requestAbort());
     wsServer.setRunner(taskRunner);
     wsServer.setIndexer(indexer);
+    const graphStore = new GraphStore(
+        workspaceRoot,
+        vscode.workspace.getConfiguration('deepseekContextSync').get<string>('graphPath', 'graphify-out/graph.json')
+    );
+    wsServer.setGraphStore(graphStore);
     wsServer.setStateManager(stateManager);
 
     const indexSub = contextManager.onDidChange(e => {
@@ -73,6 +79,9 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     const cfgSub = vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('deepseekContextSync.graphPath')) {
+            graphStore.setPath(vscode.workspace.getConfiguration('deepseekContextSync').get<string>('graphPath', 'graphify-out/graph.json'));
+        }
         if (e.affectsConfiguration('deepseekContextSync.allowSensitiveFiles')) {
             setAllowSensitive(
                 vscode.workspace.getConfiguration('deepseekContextSync')

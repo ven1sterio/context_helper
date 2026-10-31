@@ -7,6 +7,8 @@ import { TaskRunner } from './taskRunner';
 import { Indexer } from './indexer';
 import { StateManager, StateUpdate } from './stateManager';
 import { selectFiles, buildSelectiveContext, ScoredFile } from './selector';
+import { GraphStore } from './graphStore';
+import { selectWithGraph } from './graphSelector';
 import { getTimeouts, timeoutsPayload, ALLOWED_TIMEOUTS } from './timeouts';
 
 export interface ApplyOptions {
@@ -30,6 +32,8 @@ export class WsServer {
     private applyAbortHandler?: () => void;
     private runner?: TaskRunner;
     private indexer?: Indexer;
+    private graphStore?: GraphStore;
+    private lastSelectionInfo: { source: string; stale: number; report: string } = { source: 'local', stale: 0, report: '' };
     private stateManager?: StateManager;
     private abortRequested = false;
     private configSub: vscode.Disposable | null = null;
@@ -176,7 +180,8 @@ export class WsServer {
                             total += tokens;
                             return { path: f.path, score: Math.round(f.score * 10) / 10, tokens, reasons: f.reasons.slice(0, 3) };
                         });
-                        send({ type: 'selection', files, total, request });
+                        send({ type: 'selection', files, total, request,
+                            source: this.lastSelectionInfo.source, stale: this.lastSelectionInfo.stale });
                     } catch (e) {
                         send({ type: 'selection', error: 'Falha ao selecionar: ' + (e instanceof Error ? e.message : String(e)) });
                     }
@@ -193,7 +198,9 @@ export class WsServer {
                             .get<number>('maxContextTokens', 120000);
                         const result = buildSelectiveContext(paths, maxTokens, this.contextManager.getAllFiles(), this.indexer.getIndex());
                         send({
-                            type: 'selectionContext', data: result.text,
+                            type: 'selectionContext',
+                            data: (this.lastSelectionInfo.report
+                                ? '[VISÃO GERAL DO PROJETO — graphify]\n' + this.lastSelectionInfo.report + '\n\n' : '') + result.text,
                             tree: this.contextManager.buildTree(),
                             files: result.included.length + result.skeleton.length,
                             chars: result.chars, tokens: result.tokens,
@@ -273,7 +280,25 @@ export class WsServer {
 
     private selectLocal(request: string): ScoredFile[] {
         if (!this.indexer) return [];
-        return selectFiles(request, this.indexer.getIndex(), 40, this.contextManager.getAllFiles());
+        const contents = this.contextManager.getAllFiles();
+        const local = selectFiles(request, this.indexer.getIndex(), 40, contents);
+
+        const mode = vscode.workspace.getConfiguration('deepseekContextSync').get<string>('useGraph', 'auto');
+        this.lastSelectionInfo = { source: 'local', stale: 0, report: '' };
+        if (mode === 'off' || !this.graphStore) return local;
+
+        if (!this.graphStore.load(new Set(contents.keys()))) return local;
+        const graph = this.graphStore.get();
+        if (!graph) return local;
+
+        const sel = selectWithGraph(request, graph, local, { maxFiles: 40 });
+        if (!sel.usedGraph) return local;
+        this.lastSelectionInfo = {
+            source: local.length > 0 ? 'híbrido' : 'grafo',
+            stale: this.graphStore.staleCount(contents.keys()),
+            report: sel.seeds.length < 3 ? this.graphStore.readReport() : ''
+        };
+        return sel.files;
     }
 
     private broadcastConfig(): void {
@@ -287,6 +312,7 @@ export class WsServer {
     setApplyAbortHandler(handler: () => void) { this.applyAbortHandler = handler; }
     setRunner(runner: TaskRunner) { this.runner = runner; }
     setIndexer(indexer: Indexer) { this.indexer = indexer; }
+    setGraphStore(store: GraphStore) { this.graphStore = store; }
     setStateManager(mgr: StateManager) { this.stateManager = mgr; }
     getToken(): string { return this.token; }
 

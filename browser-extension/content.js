@@ -447,6 +447,10 @@ async function handleSelectContext() {
     if (res.error) { toast('⚠️ ' + res.error); return; }
     if (!res.files || res.files.length === 0) { toast('Nenhum arquivo corresponde ao pedido.'); return; }
 
+    const origem = res.source && res.source !== 'local' ? ` (via ${res.source})` : '';
+    if (res.stale > 0) toast(`⚠️ O graph.json está desatualizado (${res.stale} arquivo(s) mais novos). Rode "graphify . --update".`);
+    else toast(`🎯 ${res.files.length} arquivo(s) escolhidos${origem}.`);
+
     if (selectReview) { showSelection(res.files, res.total, question); return; }
 
     // Padrão: seleciona e COLA o conteúdo de uma vez (sem etapa extra).

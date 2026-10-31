@@ -50,8 +50,12 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
         this.abortRequested = false;
 
-        const plan = planFiles(input, this.workspaceRoot, abs => this.readFileSync(abs));
+        // Modo parcial só com confirmação humana; o agente autônomo (auto) fica atômico.
+        const mode = vscode.workspace.getConfiguration('deepseekContextSync').get<string>('applyMode', 'partial');
+        const partial = !options.auto && mode === 'partial';
+        const plan = planFiles(input, this.workspaceRoot, abs => this.readFileSync(abs), { partial, allowUnfenced: !options.auto });
         if (!plan.ok) return { status: 'error', message: plan.error };
+        const { skipped, warnings } = plan;
 
         this.busy = true;
         this.proposals.clear();
@@ -64,12 +68,15 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
             if (options.auto) {
                 await this.backup(entries);
-                return await this.write(entries);
+                return await this.write(entries, skipped, warnings);
             }
 
+            const title = skipped.length > 0
+                ? `Aplicar ${entries.length} arquivo(s)? ${skipped.length} edição(ões) NÃO casaram e serão ignoradas.`
+                : `Aplicar alterações do DeepSeek em ${entries.length} arquivo(s)?`;
             let choice: string | undefined = await vscode.window.showWarningMessage(
-                `Aplicar alterações do DeepSeek em ${entries.length} arquivo(s)?`,
-                { modal: true, detail: this.describe(entries) },
+                title,
+                { modal: true, detail: this.describe(entries, skipped, warnings) },
                 'Aplicar',
                 'Revisar diff primeiro'
             );
@@ -91,7 +98,7 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
             }
 
             await this.backup(entries);
-            return await this.write(entries);
+            return await this.write(entries, skipped, warnings);
         } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
             return { status: 'error', message };
@@ -126,8 +133,8 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         return entries;
     }
 
-    private describe(entries: Entry[]): string {
-        return entries.map(e => {
+    private describe(entries: Entry[], skipped: string[] = [], warnings: string[] = []): string {
+        const files = entries.map(e => {
             if (!e.doc) return `• ${e.file.rel} — NOVO (${e.newLines} linhas)`;
             let line = `• ${e.file.rel} — ${e.oldLines} → ${e.newLines} linhas`;
             const name = e.file.rel.split('/').pop() ?? '';
@@ -142,6 +149,10 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
             }
             return line;
         }).join('\n');
+        const extra: string[] = [];
+        if (skipped.length) extra.push('⛔ Ignoradas (não casaram):', ...skipped.map(m => `  - ${m}`));
+        if (warnings.length) extra.push('ℹ️ Avisos:', ...warnings.map(m => `  - ${m}`));
+        return extra.length ? `${files}\n\n${extra.join('\n')}` : files;
     }
 
     /**
@@ -190,7 +201,7 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         }
     }
 
-    private async write(entries: Entry[]): Promise<ApplyResult> {
+    private async write(entries: Entry[], skipped: string[] = [], warnings: string[] = []): Promise<ApplyResult> {
         const edit = new vscode.WorkspaceEdit();
 
         for (const e of entries) {
@@ -217,7 +228,17 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
             ? names.join(', ')
             : `${names.slice(0, 3).join(', ')} e mais ${names.length - 3}`;
         vscode.window.showInformationMessage(`✅ DeepSeek: ${names.length} arquivo(s) atualizado(s): ${shown}`);
-        return { status: 'applied', message: `${names.length} arquivo(s) atualizado(s).`, files: names };
+        if (skipped.length) {
+            vscode.window.showWarningMessage(`DeepSeek: ${skipped.length} edição(ões) ignorada(s):\n${skipped.join('\n')}`);
+        }
+        const tail = skipped.length ? ` ⚠️ ${skipped.length} edição(ões) ignorada(s): ${skipped.join(' | ')}` : '';
+        return {
+            status: 'applied',
+            message: `${names.length} arquivo(s) atualizado(s).${tail}`,
+            files: names,
+            skipped,
+            warnings
+        };
     }
 
     dispose() {

@@ -2,7 +2,7 @@
   "name": "deepseek-context-sync",
   "displayName": "DeepSeek Context Sync",
   "description": "Sincroniza o contexto do projeto com o chat web do DeepSeek ou do Gemini (via página, sem API), com opção de agente autônomo (Full Code).",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -88,6 +88,37 @@
           "type": "boolean",
           "default": true,
           "description": "Executa o build/teste no terminal integrado do VS Code."
+        },
+        "deepseekContextSync.graphPath": {
+          "type": "string",
+          "default": "graphify-out/graph.json",
+          "description": "Caminho (relativo ao workspace) do graph.json gerado pelo graphify, usado pelo seletivo."
+        },
+        "deepseekContextSync.applyMode": {
+          "type": "string",
+          "enum": [
+            "partial",
+            "atomic"
+          ],
+          "enumDescriptions": [
+            "Aplica as edições que casam e lista as que não casaram (pede confirmação)",
+            "Qualquer edição que não case rejeita tudo"
+          ],
+          "default": "partial",
+          "description": "Como aplicar edições SEARCH/REPLACE quando alguma não casa. O modo Full Code (automático) sempre usa 'atomic'."
+        },
+        "deepseekContextSync.useGraph": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Usa o grafo se existir",
+            "Ignora o grafo"
+          ],
+          "default": "auto",
+          "description": "Usar o graph.json do graphify para escolher arquivos no modo seletivo."
         }
       }
     }
@@ -95,7 +126,9 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build": "tsc -p ./"
+    "build": "tsc -p ./",
+    "test:graph": "npm run compile && node test/graph.smoke.js",
+    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

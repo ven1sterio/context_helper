@@ -130,7 +130,7 @@ class DeepSeekProvider {
     }
 
     readStatus(text) {
-        const tail = (text || '').slice(-400);
+        const tail = (text || '').slice(-1000);
         const re = /\[\[\s*STATUS\s*:\s*(CONTINUAR|CONCLU[IÍ]DO)\s*\]\]/gi;
         let last = null, m;
         while ((m = re.exec(tail)) !== null) last = m[1].toUpperCase();
