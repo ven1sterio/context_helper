@@ -1,0 +1,216 @@
+/**
+ * Validação das mensagens recebidas pelo WebSocket.
+ *
+ * Cada tipo tem campos obrigatórios, tipos e limites de tamanho. Mensagens
+ * inválidas são recusadas ANTES de chegar em applyPlan/applyManager/selector.
+ *
+ * A validação aqui é puramente estrutural (forma e limites). A resolução de
+ * caminho é feita em security/pathValidator.ts; a checagem de nomes sensíveis
+ * fica em pathRules.ts.
+ */
+
+export const MAX_FILES_PER_APPLY = 80;
+export const MAX_ITEM_CHARS = 500_000;
+export const MAX_PATHS_PER_SELECTION = 200;
+export const MAX_STATE_TEXT = 50_000;
+export const MAX_QUESTION = 20_000;
+
+const MAX_STATE_LIST_ITEMS = 40;
+const MAX_STATE_ITEM_CHARS = 500;
+const MAX_FILEPATH_CHARS = 1024;
+
+export type ValidatedMessage =
+    | { type: 'ping' }
+    | { type: 'abort' }
+    | { type: 'getState' }
+    | { type: 'request'; mode: string }
+    | {
+        type: 'applyFiles';
+        files: unknown[];
+        autoApply: boolean;
+        runAfter: boolean;
+        missionId?: string;
+        runId?: string;
+        modelStatus: 'continue' | 'done' | null;
+    }
+    | { type: 'selectContext'; request: string }
+    | { type: 'buildSelection'; paths: string[] }
+    | { type: 'setTimeout'; which: string; value: number }
+    | { type: 'updateState'; patch: Record<string, unknown> }
+    | { type: 'startMission'; title: string; objective: string }
+    | { type: 'cancelRun'; reason: string }
+    | { type: 'getRun' };
+
+export type ValidationResult =
+    | { ok: true; message: ValidatedMessage }
+    | { ok: false; error: string };
+
+const fail = (error: string): ValidationResult => ({ ok: false, error });
+
+const isString = (v: unknown): v is string => typeof v === 'string';
+
+function checkStringArray(v: unknown, max: number, maxChars: number): string[] | null {
+    if (!Array.isArray(v)) return null;
+    if (v.length > max) return null;
+    const out: string[] = [];
+    for (const item of v) {
+        if (!isString(item) || item.length > maxChars) return null;
+        out.push(item);
+    }
+    return out;
+}
+
+function validateApplyItem(item: unknown): { ok: true; value: unknown } | { ok: false; error: string } {
+    if (!item || typeof item !== 'object') return { ok: false, error: 'item inválido' };
+    const it = item as Record<string, unknown>;
+    if (!isString(it.filePath) || it.filePath.length === 0 || it.filePath.length > MAX_FILEPATH_CHARS) {
+        return { ok: false, error: 'filePath inválido' };
+    }
+    if (it.isEdit) {
+        if (!isString(it.search)) return { ok: false, error: `SEARCH ausente em ${it.filePath}` };
+        if (!isString(it.replace)) return { ok: false, error: `REPLACE ausente em ${it.filePath}` };
+        if (it.search.length > MAX_ITEM_CHARS) return { ok: false, error: `SEARCH grande demais em ${it.filePath}` };
+        if (it.replace.length > MAX_ITEM_CHARS) return { ok: false, error: `REPLACE grande demais em ${it.filePath}` };
+        return {
+            ok: true,
+            value: {
+                filePath: it.filePath,
+                isEdit: true,
+                search: it.search,
+                replace: it.replace,
+                unfenced: it.unfenced === true
+            }
+        };
+    }
+    if (!isString(it.content)) return { ok: false, error: `conteúdo ausente em ${it.filePath}` };
+    if (it.content.length > MAX_ITEM_CHARS) return { ok: false, error: `conteúdo grande demais em ${it.filePath}` };
+    return { ok: true, value: { filePath: it.filePath, content: it.content } };
+}
+
+export function validateMessage(raw: unknown): ValidationResult {
+    if (!raw || typeof raw !== 'object') return fail('mensagem não é objeto');
+    const m = raw as Record<string, unknown>;
+    const type = m.type;
+    if (!isString(type)) return fail('mensagem sem "type"');
+
+    switch (type) {
+        case 'ping':
+            return { ok: true, message: { type: 'ping' } };
+        case 'abort':
+            return { ok: true, message: { type: 'abort' } };
+        case 'getState':
+            return { ok: true, message: { type: 'getState' } };
+
+        case 'request': {
+            const mode = isString(m.mode) ? m.mode : '';
+            if (mode.length > 32) return fail('modo inválido');
+            return { ok: true, message: { type: 'request', mode } };
+        }
+
+        case 'applyFiles': {
+            if (!Array.isArray(m.files)) return fail('applyFiles: "files" ausente');
+            if (m.files.length > MAX_FILES_PER_APPLY * 4) {
+                return fail(`applyFiles: operações demais (máximo ${MAX_FILES_PER_APPLY * 4})`);
+            }
+            const files: unknown[] = [];
+            for (const item of m.files) {
+                const r = validateApplyItem(item);
+                if (!r.ok) return fail(`applyFiles: ${r.error}`);
+                files.push(r.value);
+            }
+            const missionId = isString(m.missionId) && m.missionId.length <= 200 ? m.missionId : undefined;
+            const runId = isString(m.runId) && m.runId.length <= 200 ? m.runId : undefined;
+            const modelStatus = (m.modelStatus === 'continue' || m.modelStatus === 'done') ? m.modelStatus : null;
+            return {
+                ok: true,
+                message: {
+                    type: 'applyFiles',
+                    files,
+                    autoApply: !!m.autoApply,
+                    runAfter: !!m.runAfter,
+                    missionId,
+                    runId,
+                    modelStatus
+                }
+            };
+        }
+
+        case 'selectContext': {
+            if (!isString(m.request)) return fail('selectContext: "request" ausente');
+            if (m.request.length > MAX_QUESTION) return fail('selectContext: pedido grande demais');
+            return { ok: true, message: { type: 'selectContext', request: m.request } };
+        }
+
+        case 'buildSelection': {
+            if (!Array.isArray(m.paths)) return fail('buildSelection: "paths" ausente');
+            if (m.paths.length > MAX_PATHS_PER_SELECTION) return fail('buildSelection: arquivos demais');
+            const paths: string[] = [];
+            for (const p of m.paths) {
+                if (!isString(p) || p.length === 0 || p.length > MAX_FILEPATH_CHARS) {
+                    return fail('buildSelection: path inválido');
+                }
+                paths.push(p);
+            }
+            return { ok: true, message: { type: 'buildSelection', paths } };
+        }
+
+        case 'setTimeout': {
+            const which = isString(m.which) ? m.which : '';
+            const value = Number(m.value);
+            if (!['response', 'run', 'agent', 'all'].includes(which)) {
+                return fail(`setTimeout: "which" inválido: ${which}`);
+            }
+            if (!Number.isFinite(value) || value <= 0 || value > 3600) {
+                return fail('setTimeout: valor inválido');
+            }
+            return { ok: true, message: { type: 'setTimeout', which, value } };
+        }
+
+        case 'updateState': {
+            const rawPatch = m.patch;
+            if (!rawPatch || typeof rawPatch !== 'object') return fail('updateState: "patch" ausente');
+            const p = rawPatch as Record<string, unknown>;
+            const patch: Record<string, unknown> = {};
+            if (isString(p.objective)) {
+                if (p.objective.length > MAX_STATE_TEXT) return fail('updateState: objective grande demais');
+                patch.objective = p.objective;
+            }
+            if (isString(p.lastFailure)) {
+                if (p.lastFailure.length > MAX_STATE_TEXT) return fail('updateState: lastFailure grande demais');
+                patch.lastFailure = p.lastFailure;
+            }
+            for (const key of ['plan', 'working', 'broken', 'decisions', 'rollbacks', 'touched'] as const) {
+                if (p[key] !== undefined) {
+                    const arr = checkStringArray(p[key], MAX_STATE_LIST_ITEMS, MAX_STATE_ITEM_CHARS);
+                    if (arr === null) return fail(`updateState: "${key}" inválido`);
+                    patch[key] = arr;
+                }
+            }
+            return { ok: true, message: { type: 'updateState', patch } };
+        }
+
+        case 'startMission': {
+            if (!isString(m.title) || m.title.trim().length === 0) {
+                return fail('startMission: "title" ausente');
+            }
+            if (!isString(m.objective) || m.objective.trim().length === 0) {
+                return fail('startMission: "objective" ausente');
+            }
+            if (m.title.length > 500) return fail('startMission: title grande demais');
+            if (m.objective.length > MAX_QUESTION) return fail('startMission: objective grande demais');
+            return { ok: true, message: { type: 'startMission', title: m.title, objective: m.objective } };
+        }
+
+        case 'cancelRun': {
+            const reason = isString(m.reason) ? m.reason.slice(0, 500) : 'cancelado';
+            return { ok: true, message: { type: 'cancelRun', reason } };
+        }
+
+        case 'getRun': {
+            return { ok: true, message: { type: 'getRun' } };
+        }
+
+        default:
+            return fail(`tipo desconhecido: ${type}`);
+    }
+}

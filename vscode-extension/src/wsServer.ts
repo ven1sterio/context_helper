@@ -10,6 +10,20 @@ import { selectFiles, buildSelectiveContext, ScoredFile } from './selector';
 import { GraphStore } from './graphStore';
 import { selectWithGraph } from './graphSelector';
 import { getTimeouts, timeoutsPayload, ALLOWED_TIMEOUTS } from './timeouts';
+import { AuthProtocol } from './security/authProtocol';
+import { validateMessage } from './security/messageValidator';
+import { PlanManager } from './agent/planManager';
+import { TaskQueue } from './agent/taskQueue';
+import { RunManager, AdvanceResult } from './agent/runManager';
+import { RecoveryManager } from './agent/recoveryManager';
+import { IterationRecord } from './agent/agentTypes';
+
+export interface AgentManagers {
+    plan: PlanManager;
+    queue: TaskQueue;
+    run: RunManager;
+    recovery: RecoveryManager;
+}
 
 export interface ApplyOptions {
     auto?: boolean;
@@ -40,6 +54,7 @@ export class WsServer {
     private graphStore?: GraphStore;
     private lastSelectionInfo: { source: string; stale: number; report: string } = { source: 'local', stale: 0, report: '' };
     private stateManager?: StateManager;
+    private agents?: AgentManagers;
     private abortRequested = false;
     private configSub: vscode.Disposable | null = null;
 
@@ -52,17 +67,9 @@ export class WsServer {
             port,
             host: '127.0.0.1',
             maxPayload,
+            // Token NÃO fica mais na URL. Só checamos a origem aqui; a
+            // autenticação por token acontece via AuthProtocol (primeiro frame).
             verifyClient: (info, cb) => {
-                let supplied = '';
-                try {
-                    const url = new URL(info.req.url || '/', `http://127.0.0.1:${port}`);
-                    supplied = url.searchParams.get('token') || '';
-                } catch { supplied = ''; }
-                if (supplied !== this.token) {
-                    options.onError?.(new Error('token inválido — configure o token no painel do navegador'));
-                    cb(false, 1008, 'Invalid token');
-                    return;
-                }
                 const origin = (info.origin || (info.req.headers.origin as string | undefined) || '').trim();
                 if (!origin) { cb(true); return; }
                 if (ALLOWED_ORIGINS.includes(origin) || origin.startsWith('chrome-extension://')) {
@@ -83,8 +90,6 @@ export class WsServer {
         });
 
         this.wss.on('connection', (ws) => {
-            ws.send(JSON.stringify({ type: 'config', timeouts: timeoutsPayload() }));
-
             const pending = new Map<string, ChangeKind>();
             let treeDirty = false;
             let sentFull = false;
@@ -98,195 +103,357 @@ export class WsServer {
                 if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
             };
 
+            // ----- Autenticação (token fora da URL) -----
+            const auth = new AuthProtocol({
+                token: this.token,
+                onAuthenticated: () => {
+                    send({ type: 'config', timeouts: timeoutsPayload() });
+                },
+                onRejected: (reason) => {
+                    send({ type: 'error', message: `Autenticação falhou: ${reason}` });
+                    try { ws.close(1008, 'Auth failed'); } catch { /* ignore */ }
+                }
+            });
+            auth.start();
+            send({ type: 'auth-required' });
+
             ws.on('message', async raw => {
                 let msg: any;
                 try { msg = JSON.parse(raw.toString()); } catch { return; }
                 if (!msg || typeof msg !== 'object') return;
 
-                if (msg.type === 'ping') return;
-
-                if (msg.type === 'abort') {
-                    this.abortRequested = true;
-                    try { this.applyAbortHandler?.(); } catch { /* ignore */ }
-                    try { this.runner?.cancel(); } catch { /* ignore */ }
-                    send({ type: 'aborted', ok: true });
+                // Portão de autenticação
+                if (!auth.isAuthenticated()) {
+                    auth.handleMessage(msg);
                     return;
                 }
 
-                if (msg.type === 'setTimeout') {
-                    const which = String(msg.which || '');
-                    const value = Number(msg.value);
-                    if (!ALLOWED_TIMEOUTS.includes(value)) {
-                        send({ type: 'error', message: 'Timeout inválido (use 60, 300 ou 600 segundos).' });
+                const v = validateMessage(msg);
+                if (!v.ok) {
+                    send({ type: 'error', message: v.error });
+                    return;
+                }
+                const m = v.message;
+
+                switch (m.type) {
+                    case 'ping':
+                        return;
+
+                    case 'abort': {
+                        this.abortRequested = true;
+                        try { this.applyAbortHandler?.(); } catch { /* ignore */ }
+                        try { this.runner?.cancel(); } catch { /* ignore */ }
+                        send({ type: 'aborted', ok: true });
                         return;
                     }
-                    const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
-                    const map: Record<string, string> = {
-                        response: 'responseTimeout',
-                        run: 'runTimeout'
-                    };
-                    let targets: string[];
-                    if (which === 'agent') targets = ['response', 'run'];
-                    else if (which === 'all') targets = ['response', 'run'];
-                    else if (which in map) targets = [which];
-                    else { send({ type: 'error', message: `Timeout desconhecido: ${which}` }); return; }
-                    try {
-                        for (const t of targets) {
-                            await cfg.update(map[t], value, vscode.ConfigurationTarget.Global);
-                        }
-                        send({ type: 'config', timeouts: timeoutsPayload() });
-                    } catch (e) {
-                        send({ type: 'error', message: e instanceof Error ? e.message : String(e) });
-                    }
-                    return;
-                }
 
-                // ---------- Fase 5: estado ----------
-                if (msg.type === 'updateState') {
-                    if (!this.stateManager) { send({ type: 'stateUpdated', ok: false }); return; }
-                    const patch: StateUpdate = {};
-                    if (typeof msg.patch === 'object' && msg.patch) {
-                        const p = msg.patch;
-                        if (typeof p.objective === 'string') patch.objective = p.objective;
-                        if (Array.isArray(p.plan)) patch.plan = p.plan.filter((x: any) => typeof x === 'string');
-                        if (Array.isArray(p.working)) patch.working = p.working.filter((x: any) => typeof x === 'string');
-                        if (Array.isArray(p.broken)) patch.broken = p.broken.filter((x: any) => typeof x === 'string');
-                        if (Array.isArray(p.decisions)) patch.decisions = p.decisions.filter((x: any) => typeof x === 'string');
-                        if (Array.isArray(p.rollbacks)) patch.rollbacks = p.rollbacks.filter((x: any) => typeof x === 'string');
-                        if (typeof p.lastFailure === 'string') patch.lastFailure = p.lastFailure;
-                        if (Array.isArray(p.touched)) patch.touched = p.touched.filter((x: any) => typeof x === 'string');
-                    }
-                    this.stateManager.update(patch);
-                    send({ type: 'stateUpdated', ok: true });
-                    return;
-                }
-
-                if (msg.type === 'getState') {
-                    if (!this.stateManager) { send({ type: 'state', state: '' }); return; }
-                    send({ type: 'state', state: this.stateManager.toMarkdown() });
-                    return;
-                }
-
-                if (msg.type === 'selectContext') {
-                    if (!this.indexer) { send({ type: 'selection', error: 'Índice não disponível.' }); return; }
-                    const request = String(msg.request || '').trim();
-                    if (!request) { send({ type: 'selection', error: 'Digite o pedido antes de usar o seletivo.' }); return; }
-                    try {
-                        const selected = this.selectLocal(request);
-                        if (selected.length === 0) {
-                            send({ type: 'selection', files: [], total: 0, request, error: 'Nenhum arquivo corresponde ao pedido.' });
+                    case 'setTimeout': {
+                        const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
+                        const map: Record<string, string> = {
+                            response: 'responseTimeout',
+                            run: 'runTimeout'
+                        };
+                        if (!ALLOWED_TIMEOUTS.includes(m.value)) {
+                            send({ type: 'error', message: 'Timeout inválido (use 60, 300 ou 600 segundos).' });
                             return;
                         }
-                        const idx = this.indexer.getIndex();
-                        let total = 0;
-                        const files = selected.map((f: ScoredFile) => {
-                            const entry = idx.files[f.path];
-                            const tokens = entry?.tokens ?? 0;
-                            total += tokens;
-                            return { path: f.path, score: Math.round(f.score * 10) / 10, tokens, reasons: f.reasons.slice(0, 3) };
-                        });
-                        send({ type: 'selection', files, total, request,
-                            source: this.lastSelectionInfo.source, stale: this.lastSelectionInfo.stale });
-                    } catch (e) {
-                        send({ type: 'selection', error: 'Falha ao selecionar: ' + (e instanceof Error ? e.message : String(e)) });
-                    }
-                    return;
-                }
-
-                if (msg.type === 'buildSelection') {
-                    if (!this.indexer) { send({ type: 'selectionContext', error: 'Índice não disponível.' }); return; }
-                    const paths: string[] = Array.isArray(msg.paths)
-                        ? msg.paths.filter((p: any) => typeof p === 'string' && p.length > 0) : [];
-                    if (paths.length === 0) { send({ type: 'selectionContext', error: 'Nenhum arquivo selecionado.' }); return; }
-                    try {
-                        const maxTokens = vscode.workspace.getConfiguration('deepseekContextSync')
-                            .get<number>('maxContextTokens', 120000);
-                        const result = buildSelectiveContext(paths, maxTokens, this.contextManager.getAllFiles(), this.indexer.getIndex());
-                        send({
-                            type: 'selectionContext',
-                            data: (this.lastSelectionInfo.report
-                                ? '[VISÃO GERAL DO PROJETO — graphify]\n' + this.lastSelectionInfo.report + '\n\n' : '') + result.text,
-                            tree: this.contextManager.buildTree(),
-                            files: result.included.length + result.skeleton.length,
-                            chars: result.chars, tokens: result.tokens,
-                            included: result.included, skeleton: result.skeleton, missing: result.missing
-                        });
-                    } catch (e) {
-                        send({ type: 'selectionContext', error: 'Falha ao montar contexto: ' + (e instanceof Error ? e.message : String(e)) });
-                    }
-                    return;
-                }
-
-                if (msg.type === 'request') {
-                    if (msg.mode === 'full' || !sentFull) {
-                        const r = this.contextManager.buildFull();
-                        pending.clear(); treeDirty = false; sentFull = true;
-                        send({
-                            type: 'context', mode: 'full', data: r.text,
-                            tree: this.contextManager.buildTree(),
-                            files: r.files, chars: r.chars, omitted: r.omitted.length
-                        });
-                    } else {
-                        const r = this.contextManager.buildDelta(pending);
-                        for (const p of r.included) pending.delete(p);
-                        const sendTree = treeDirty; treeDirty = false;
-                        send({
-                            type: 'context',
-                            mode: (r.included.length > 0 || sendTree) ? 'delta' : 'empty',
-                            data: r.text,
-                            tree: sendTree ? this.contextManager.buildTree() : undefined,
-                            files: r.included.length, chars: r.chars, remaining: pending.size
-                        });
-                    }
-                } else if (msg.type === 'applyFiles') {
-                    if (!this.applyHandler) { send({ type: 'applyResult', status: 'error', message: 'Aplicação não disponível.' }); return; }
-                    try {
-                        const auto = !!msg.autoApply;
-                        const runAfter = !!msg.runAfter;
-                        this.abortRequested = false;
-
-                        const result = await this.applyHandler(msg.files, { auto });
-                        if (this.abortRequested) {
-                            send({ type: 'applyResult', status: 'cancelled', message: 'Cancelado pelo usuário.', files: result.files });
-                            return;
-                        }
-
-                        if (auto && runAfter && result.status === 'applied') {
-                            if (this.runner) {
-                                const run = await this.runner.run();
-                                if (this.abortRequested || run.aborted) {
-                                    send({
-                                        type: 'applyResult', status: 'cancelled', message: 'Cancelado pelo usuário.',
-                                        files: result.files, runSuccess: false, runCommand: run.command, runOutput: run.output,
-                                        runDurationMs: run.durationMs, runExitCode: run.exitCode, runVia: run.via
-                                    });
-                                } else {
-                                    send({
-                                        type: 'applyResult', ...result,
-                                        runSuccess: run.success, runCommand: run.command, runOutput: run.output,
-                                        runDurationMs: run.durationMs, runExitCode: run.exitCode, runVia: run.via
-                                    });
-                                }
-                            } else {
-                                send({ type: 'applyResult', ...result, runSuccess: true, runOutput: '(Sem runner configurado.)' });
+                        let targets: string[];
+                        if (m.which === 'agent' || m.which === 'all') targets = ['response', 'run'];
+                        else if (m.which in map) targets = [m.which];
+                        else { send({ type: 'error', message: `Timeout desconhecido: ${m.which}` }); return; }
+                        try {
+                            for (const t of targets) {
+                                await cfg.update(map[t], m.value, vscode.ConfigurationTarget.Global);
                             }
-                        } else {
-                            send({ type: 'applyResult', ...result });
+                            send({ type: 'config', timeouts: timeoutsPayload() });
+                        } catch (e) {
+                            send({ type: 'error', message: e instanceof Error ? e.message : String(e) });
                         }
-                    } catch (e) {
-                        send({ type: 'applyResult', status: 'error', message: e instanceof Error ? e.message : String(e) });
+                        return;
+                    }
+
+                    case 'updateState': {
+                        if (!this.stateManager) { send({ type: 'stateUpdated', ok: false }); return; }
+                        this.stateManager.update(m.patch as StateUpdate);
+                        send({ type: 'stateUpdated', ok: true });
+                        return;
+                    }
+
+                    case 'getState': {
+                        if (!this.stateManager) { send({ type: 'state', state: '' }); return; }
+                        send({ type: 'state', state: this.stateManager.toMarkdownWithMemory() });
+                        return;
+                    }
+
+                    case 'selectContext': {
+                        if (!this.indexer) { send({ type: 'selection', error: 'Índice não disponível.' }); return; }
+                        const request = m.request.trim();
+                        if (!request) { send({ type: 'selection', error: 'Digite o pedido antes de usar o seletivo.' }); return; }
+                        try {
+                            const selected = this.selectLocal(request);
+                            if (selected.length === 0) {
+                                send({ type: 'selection', files: [], total: 0, request, error: 'Nenhum arquivo corresponde ao pedido.' });
+                                return;
+                            }
+                            const idx = this.indexer.getIndex();
+                            let total = 0;
+                            const files = selected.map((f: ScoredFile) => {
+                                const entry = idx.files[f.path];
+                                const tokens = entry?.tokens ?? 0;
+                                total += tokens;
+                                return { path: f.path, score: Math.round(f.score * 10) / 10, tokens, reasons: f.reasons.slice(0, 3) };
+                            });
+                            send({ type: 'selection', files, total, request,
+                                source: this.lastSelectionInfo.source, stale: this.lastSelectionInfo.stale });
+                        } catch (e) {
+                            send({ type: 'selection', error: 'Falha ao selecionar: ' + (e instanceof Error ? e.message : String(e)) });
+                        }
+                        return;
+                    }
+
+                    case 'buildSelection': {
+                        if (!this.indexer) { send({ type: 'selectionContext', error: 'Índice não disponível.' }); return; }
+                        const paths = m.paths;
+                        if (paths.length === 0) { send({ type: 'selectionContext', error: 'Nenhum arquivo selecionado.' }); return; }
+                        try {
+                            const maxTokens = vscode.workspace.getConfiguration('deepseekContextSync')
+                                .get<number>('maxContextTokens', 120000);
+                            const result = buildSelectiveContext(paths, maxTokens, this.contextManager.getAllFiles(), this.indexer.getIndex());
+                            send({
+                                type: 'selectionContext',
+                                data: (this.lastSelectionInfo.report
+                                    ? '[VISÃO GERAL DO PROJETO — graphify]\n' + this.lastSelectionInfo.report + '\n\n' : '') + result.text,
+                                tree: this.contextManager.buildTree(),
+                                files: result.included.length + result.skeleton.length,
+                                chars: result.chars, tokens: result.tokens,
+                                included: result.included, skeleton: result.skeleton, missing: result.missing
+                            });
+                        } catch (e) {
+                            send({ type: 'selectionContext', error: 'Falha ao montar contexto: ' + (e instanceof Error ? e.message : String(e)) });
+                        }
+                        return;
+                    }
+
+                    case 'request': {
+                        if (m.mode === 'full' || !sentFull) {
+                            const r = this.contextManager.buildFull();
+                            pending.clear(); treeDirty = false; sentFull = true;
+                            send({
+                                type: 'context', mode: 'full', data: r.text,
+                                tree: this.contextManager.buildTree(),
+                                files: r.files, chars: r.chars, omitted: r.omitted.length
+                            });
+                        } else {
+                            const r = this.contextManager.buildDelta(pending);
+                            for (const p of r.included) pending.delete(p);
+                            const sendTree = treeDirty; treeDirty = false;
+                            send({
+                                type: 'context',
+                                mode: (r.included.length > 0 || sendTree) ? 'delta' : 'empty',
+                                data: r.text,
+                                tree: sendTree ? this.contextManager.buildTree() : undefined,
+                                files: r.included.length, chars: r.chars, remaining: pending.size
+                            });
+                        }
+                        return;
+                    }
+
+                    case 'applyFiles': {
+                        if (!this.applyHandler) { send({ type: 'applyResult', status: 'error', message: 'Aplicação não disponível.' }); return; }
+                        try {
+                            const auto = m.autoApply;
+                            const runAfter = m.runAfter;
+                            this.abortRequested = false;
+                            const startedAt = new Date().toISOString();
+
+                            const result = await this.applyHandler(m.files, { auto });
+
+                            // Constrói o IterationRecord antes de decidir a próxima ação.
+                            const iteration: IterationRecord = {
+                                index: (this.agents?.run.currentRun?.iterations.length ?? 0) + 1,
+                                startedAt,
+                                endedAt: undefined,
+                                appliedFiles: result.files ?? [],
+                                errors: [],
+                                status: result.status === 'error'
+                                    ? 'apply-failed'
+                                    : result.status === 'cancelled'
+                                    ? 'cancelled'
+                                    : ((result.files && result.files.length > 0) ? 'applied' : 'no-files'),
+                                modelStatus: m.modelStatus
+                            };
+                            if (result.status === 'error') iteration.errors.push(result.message);
+
+                            if (this.abortRequested) {
+                                iteration.status = 'cancelled';
+                                iteration.errors.push('cancelado pelo usuário');
+                                iteration.endedAt = new Date().toISOString();
+                                send({
+                                    type: 'applyResult', status: 'cancelled',
+                                    message: 'Cancelado pelo usuário.',
+                                    files: result.files,
+                                    iteration,
+                                    nextAction: 'stop',
+                                    nextReason: 'cancelado'
+                                });
+                                return;
+                            }
+
+                            let runAfterResult: any = null;
+                            if (auto && runAfter && result.status === 'applied') {
+                                if (this.runner) {
+                                    const run = await this.runner.run();
+                                    runAfterResult = run;
+                                    if (this.abortRequested || run.aborted) {
+                                        iteration.status = 'cancelled';
+                                        iteration.errors.push('cancelado');
+                                    } else {
+                                        iteration.runSuccess = run.success;
+                                        iteration.runCommand = run.command;
+                                        iteration.runExitCode = run.exitCode;
+                                        iteration.runOutputTail = (run.output || '').slice(-2000);
+                                        if (!run.success) iteration.status = 'applied-build-failed';
+                                    }
+                                } else {
+                                    iteration.runSuccess = true;
+                                    iteration.runCommand = '(sem runner)';
+                                }
+                            }
+                            iteration.endedAt = new Date().toISOString();
+
+                            // Delega a decisão ao RunManager (se disponível)
+                            let advance: AdvanceResult | null = null;
+                            if (this.agents && m.missionId) {
+                                try {
+                                    advance = await this.agents.run.recordIteration({
+                                        iteration,
+                                        modelStatus: m.modelStatus
+                                    });
+                                } catch (e) {
+                                    console.error('[DeepSeek Context Sync] recordIteration:', e);
+                                }
+                            }
+
+                            const response: any = {
+                                type: 'applyResult',
+                                ...result,
+                                iteration,
+                                nextAction: advance?.action,
+                                nextReason: advance?.reason,
+                                nextPrompt: this.buildNextPrompt(advance, m.modelStatus, iteration),
+                                mission: advance?.mission ?? null
+                            };
+                            if (runAfterResult) {
+                                response.runSuccess = runAfterResult.success;
+                                response.runCommand = runAfterResult.command;
+                                response.runOutput = runAfterResult.output;
+                                response.runDurationMs = runAfterResult.durationMs;
+                                response.runExitCode = runAfterResult.exitCode;
+                                response.runVia = runAfterResult.via;
+                            }
+                            send(response);
+                        } catch (e) {
+                            send({ type: 'applyResult', status: 'error', message: e instanceof Error ? e.message : String(e) });
+                        }
+                        return;
+                    }
+
+                    case 'startMission': {
+                        if (!this.agents) {
+                            send({ type: 'missionStarted', error: 'Agente não disponível.' });
+                            return;
+                        }
+                        try {
+                            const run = await this.agents.run.start(m.title, m.objective);
+                            send({
+                                type: 'missionStarted',
+                                missionId: run.missionId,
+                                runId: run.id,
+                                taskId: this.agents.plan.current?.tasks[0]?.id ?? null
+                            });
+                        } catch (e) {
+                            send({
+                                type: 'missionStarted',
+                                error: e instanceof Error ? e.message : String(e)
+                            });
+                        }
+                        return;
+                    }
+
+                    case 'cancelRun': {
+                        if (this.agents) {
+                            try { await this.agents.run.cancel(m.reason); } catch { /* ignore */ }
+                        }
+                        send({ type: 'runCancelled', ok: true });
+                        return;
+                    }
+
+                    case 'getRun': {
+                        send({
+                            type: 'runState',
+                            run: this.agents?.run.currentRun ?? null,
+                            mission: this.agents?.plan.current ?? null
+                        });
+                        return;
                     }
                 }
             });
 
-            ws.on('close', () => subs.forEach(s => s.dispose()));
+            ws.on('close', () => {
+                auth.dispose();
+                subs.forEach(s => s.dispose());
+            });
         });
+    }
+
+    /**
+     * Texto que o `content.js` usa como próximo prompt. Se `advance` for null
+     * (sem RunManager), devolve undefined e o content.js cai no fallback.
+     */
+    private buildNextPrompt(
+        advance: AdvanceResult | null,
+        modelStatus: 'continue' | 'done' | null,
+        iteration: IterationRecord
+    ): string | undefined {
+        if (!advance) return undefined;
+        if (advance.action === 'done' || advance.action === 'stop') return undefined;
+
+        if (advance.action === 'retry') {
+            if (iteration.status === 'apply-failed') {
+                return `Falha ao aplicar:\n${iteration.errors.join('\n')}\n\n` +
+                    `Reenvie os arquivos corrigidos. Use "### FILE:" se o EDIT não casar. ` +
+                    `Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
+            }
+            if (iteration.status === 'applied-build-failed') {
+                const out = (iteration.runOutputTail || '').slice(-6000);
+                return `Os arquivos foram aplicados mas a execução falhou.\n\n` +
+                    `Comando: ${iteration.runCommand || '(desconhecido)'}` +
+                    (typeof iteration.runExitCode === 'number' ? ` (código ${iteration.runExitCode})` : '') +
+                    `\nSaída:\n\`\`\`\n${out}\n\`\`\`\n\n` +
+                    `Corrija e reenvie os arquivos (máx 20). ` +
+                    `Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
+            }
+            if (iteration.status === 'no-files') {
+                return `Você marcou [[STATUS:CONTINUAR]] mas não enviou arquivos. ` +
+                    `Envie agora os arquivos da próxima etapa. ` +
+                    `Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
+            }
+            return `Reenvie a etapa corrigida. Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
+        }
+
+        // continue
+        if (modelStatus === 'done') {
+            return `Etapa concluída. Continue com a PRÓXIMA etapa do seu plano. ` +
+                `Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
+        }
+        return `Continue com a próxima etapa do seu plano. ` +
+            `Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
     }
 
     private selectLocal(request: string): ScoredFile[] {
         if (!this.indexer) return [];
         const contents = this.contextManager.getAllFiles();
-        const local = selectFiles(request, this.indexer.getIndex(), 40, contents);
+        const local = selectFiles(request, this.indexer.getIndex(), 40, contents, { semantic: true });
 
         const mode = vscode.workspace.getConfiguration('deepseekContextSync').get<string>('useGraph', 'auto');
         this.lastSelectionInfo = { source: 'local', stale: 0, report: '' };
@@ -296,7 +463,11 @@ export class WsServer {
         const graph = this.graphStore.get();
         if (!graph) return local;
 
-        const sel = selectWithGraph(request, graph, local, { maxFiles: 40 });
+        const sel = selectWithGraph(request, graph, local, {
+            maxFiles: 40,
+            impactBonus: 2,
+            dependentsOf: (rel) => this.indexer ? this.indexer.getDependentsOf(rel) : []
+        });
         if (!sel.usedGraph) return local;
         this.lastSelectionInfo = {
             source: local.length > 0 ? 'híbrido' : 'grafo',
@@ -319,15 +490,11 @@ export class WsServer {
     setIndexer(indexer: Indexer) { this.indexer = indexer; }
     setGraphStore(store: GraphStore) { this.graphStore = store; }
     setStateManager(mgr: StateManager) { this.stateManager = mgr; }
+    setAgentManagers(m: AgentManagers) { this.agents = m; }
     getToken(): string { return this.token; }
 
     dispose() {
         this.configSub?.dispose();
-        // Encerra à força todas as conexões ANTES de fechar o servidor.
-        // Sem isso, wss.close() fica esperando os clientes (o navegador reconecta
-        // sozinho), o processo do Extension Host demora a sair e a porta 8765
-        // continua presa — o próximo F5 falha ao abrir a porta (EADDRINUSE) e a
-        // janela nova tende a abrir e fechar até o processo antigo morrer.
         try {
             for (const client of this.wss.clients) {
                 try { client.terminate(); } catch { /* ignore */ }

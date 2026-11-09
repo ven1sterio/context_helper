@@ -1,7 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-/** Nó do grafo já normalizado (arquivo relativo ao workspace, com "/"). */
 export interface GraphNode {
     id: string;
     label: string;
@@ -12,16 +11,16 @@ export interface GraphNode {
 export interface GraphEdge {
     to: string;
     relation: string;
-    weight: number; // 0..1 (relação x confiança)
+    weight: number;
 }
 
 export interface GraphData {
     nodes: Map<string, GraphNode>;
-    adj: Map<string, GraphEdge[]>;          // vizinhança nos dois sentidos
-    byFile: Map<string, string[]>;          // arquivo -> ids de nós
-    communities: Map<string, string[]>;     // comunidade -> arquivos
+    adj: Map<string, GraphEdge[]>;
+    byFile: Map<string, string[]>;
+    communities: Map<string, string[]>;
     mtimeMs: number;
-    unmapped: number;                       // nós cujo arquivo não existe no VS Code
+    unmapped: number;
 }
 
 const RELATION_WEIGHT: Array<[RegExp, number]> = [
@@ -48,29 +47,25 @@ function confidenceWeight(c: unknown): number {
 const str = (v: unknown): string => (typeof v === 'string' ? v : typeof v === 'number' ? String(v) : '');
 const endId = (v: any): string => str(v && typeof v === 'object' ? v.id : v);
 
-/** Converte o caminho que o graphify guardou em um caminho conhecido do VS Code. */
 export function normalizeFile(raw: string, root: string, known: ReadonlySet<string>): string | null {
     if (!raw) return null;
     let p = raw.replace(/\\/g, '/');
     const rootN = root.replace(/\\/g, '/').replace(/\/$/, '');
     if (p.toLowerCase().startsWith(rootN.toLowerCase() + '/')) p = p.slice(rootN.length + 1);
     p = p.replace(/^\.\//, '');
-    // remove sufixos de linha: "src/a.ts:42" / "src/a.ts#L42"
     p = p.replace(/(?:#L?\d+(?:-\d+)?|:\d+(?::\d+)?)$/, '');
     if (known.has(p)) return p;
-    // fallback: sufixo (grafo gerado em subpasta ou em outra raiz)
     const tail = '/' + p;
     let hit: string | null = null;
     for (const k of known) {
         if (k === p || k.endsWith(tail) || p.endsWith('/' + k)) {
-            if (hit && hit !== k) return null; // ambíguo
+            if (hit && hit !== k) return null;
             hit = k;
         }
     }
     return hit;
 }
 
-/** Parser tolerante: aceita `links` ou `edges`, `source_file`/`file`/`path`, `community`/`group`. */
 export function parseGraph(raw: any, root: string, known: ReadonlySet<string>, mtimeMs = 0): GraphData {
     const nodes = new Map<string, GraphNode>();
     const adj = new Map<string, GraphEdge[]>();
@@ -121,7 +116,6 @@ export function parseGraph(raw: any, root: string, known: ReadonlySet<string>, m
     return { nodes, adj, byFile, communities, mtimeMs, unmapped };
 }
 
-/** Carrega e acompanha `graphify-out/graph.json` (e o GRAPH_REPORT.md ao lado). */
 export class GraphStore {
     private data: GraphData | null = null;
     private graphFile: string;
@@ -137,7 +131,6 @@ export class GraphStore {
 
     get path(): string { return this.graphFile; }
 
-    /** (Re)carrega se o arquivo mudou. Devolve true quando há grafo utilizável. */
     load(known: ReadonlySet<string>): boolean {
         try {
             const st = fs.statSync(this.graphFile);
@@ -153,7 +146,6 @@ export class GraphStore {
 
     get(): GraphData | null { return this.data; }
 
-    /** Texto do GRAPH_REPORT.md (cortado) para pedidos vagos. */
     readReport(maxChars = 6000): string {
         try {
             const p = path.join(path.dirname(this.graphFile), 'GRAPH_REPORT.md');
@@ -173,5 +165,20 @@ export class GraphStore {
             if (n >= limit) break;
         }
         return n;
+    }
+
+    /** Lista (limitada) dos arquivos mais novos que o grafo. */
+    getStaleFiles(files: Iterable<string>, limit = 200): string[] {
+        if (!this.data) return [];
+        const out: string[] = [];
+        for (const rel of files) {
+            try {
+                if (fs.statSync(path.join(this.workspaceRoot, rel)).mtimeMs > this.data.mtimeMs + 1000) {
+                    out.push(rel);
+                    if (out.length >= limit) break;
+                }
+            } catch { /* ignore */ }
+        }
+        return out;
     }
 }

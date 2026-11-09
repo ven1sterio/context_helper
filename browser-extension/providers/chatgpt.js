@@ -65,8 +65,10 @@
         constructor() {
             this.name = 'ChatGPT';
             this.newChatUrl = 'https://chatgpt.com/';
+            // Mesmo tratamento do Gemini: acima deste tamanho o contexto vai como
+            // ARQUIVO anexo — colar centenas de KB no editor ProseMirror trava a aba.
             this.maxInlineChars = 40000;
-            this.supportsFileAttach = false; // Simplificado: cola direto no texto (ou podemos tentar o chunked)
+            this.supportsFileAttach = true;
         }
 
         isInputEmpty(input) {
@@ -140,9 +142,86 @@
         }
 
         async setInputChunked(input, text, onProgress) {
-            // ChatGPT geralmente aguenta colar direto, mas mantemos a interface
-            this.setInput(input, text);
-            return true;
+            if (!input) return false;
+            if (input.tagName === 'TEXTAREA') { this.setInput(input, text); return true; }
+            input.focus();
+            try { document.execCommand('selectAll', false, null); } catch { /* ignore */ }
+            try { document.execCommand('delete', false, null); } catch { /* ignore */ }
+            await sleep(50);
+
+            const CHUNK = 12000;
+            let pos = 0;
+            while (pos < text.length) {
+                let end = Math.min(text.length, pos + CHUNK);
+                if (end < text.length) {
+                    const nl = text.lastIndexOf('\n', end);
+                    if (nl > pos + CHUNK / 2) end = nl + 1;
+                }
+                const piece = text.slice(pos, end);
+                try {
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', piece);
+                    input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                } catch {
+                    try { document.execCommand('insertText', false, piece); } catch { /* ignore */ }
+                }
+                pos = end;
+                if (onProgress) onProgress(Math.min(100, Math.round(pos / text.length * 100)));
+                await sleep(40);
+            }
+            const expected = text.replace(/\s+/g, '').length;
+            const got = (input.textContent || input.value || '').replace(/\s+/g, '').length;
+            return got >= expected * 0.9;
+        }
+
+        /** Há um chip/preview de anexo mostrando esse nome de arquivo? */
+        hasAttachmentChip(name) {
+            const input = this.findInput();
+            const nodes = document.querySelectorAll(
+                '[class*="file" i], [class*="upload" i], [class*="attach" i], [class*="preview" i]'
+            );
+            for (const n of nodes) {
+                if (input && (n === input || input.contains(n) || n.contains(input))) continue;
+                const txt = (n.textContent || '').trim();
+                if (txt.length > 200) continue;
+                if (txt.includes(name) && isVisible(n)) return true;
+            }
+            return false;
+        }
+
+        /** Anexa um .txt (paste/drop com File). True só se o chip aparecer. */
+        async attachTextFile(input, text, filename) {
+            if (!input) return false;
+            let file;
+            try { file = new File([text], filename, { type: 'text/plain' }); } catch { return false; }
+
+            const waitChip = async (ms) => {
+                const end = Date.now() + ms;
+                while (Date.now() < end) {
+                    if (this.hasAttachmentChip(filename)) return true;
+                    await sleep(250);
+                }
+                return false;
+            };
+
+            try {
+                input.focus();
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+                if (await waitChip(6000)) return true;
+            } catch { /* tenta o drop */ }
+
+            try {
+                const target = input.closest('form') || input.parentElement || input;
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                for (const type of ['dragenter', 'dragover', 'drop']) {
+                    target.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+                }
+                if (await waitChip(6000)) return true;
+            } catch { /* ignore */ }
+            return false;
         }
 
         findSendButton() {

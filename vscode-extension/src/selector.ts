@@ -1,4 +1,5 @@
 import { IndexData, FileEntry } from './indexer';
+import { semanticSearch } from './intelligence/semanticSearch';
 
 const STOPWORDS = new Set([
   'a', 'o', 'e', 'de', 'da', 'do', 'em', 'para', 'por', 'com', 'sem', 'que', 'se',
@@ -21,7 +22,6 @@ const STOPWORDS = new Set([
   'ao', 'pelo', 'pela', 'pelos', 'pelas', 'dele', 'dela', 'esse', 'esses', 'essas', 'seu', 'sua'
 ]);
 
-/** Conceitos em linguagem natural -> termos que aparecem em caminhos/símbolos de projetos web. */
 const CONCEPTS: Array<{ words: RegExp; expand: string[]; dirs: string[] }> = [
   { words: /^(tela|telas|p[aá]gina|p[aá]ginas|screen|screens|page|pages|view|views|interface|ui|layout|visual|design|front|frontend)$/,
     expand: ['pages', 'page', 'screen', 'view', 'layout', 'components', 'component', 'styles', 'app'],
@@ -38,7 +38,6 @@ const CONCEPTS: Array<{ words: RegExp; expand: string[]; dirs: string[] }> = [
     expand: ['api'], dirs: ['pages/api/', 'app/api/'] }
 ];
 
-/** Verbos/ideias em português -> identificadores típicos de código (em inglês). */
 const SYNONYMS: Array<{ re: RegExp; add: string[] }> = [
   { re: /^(trav|congel|pendur|lent)/, add: ['timeout', 'paste', 'input', 'send', 'wait', 'delay'] },
   { re: /^(cooldown|espera|aguard|delay|intervalo|pausa)/, add: ['delay', 'wait', 'cooldown', 'sleep', 'timeout'] },
@@ -91,6 +90,11 @@ export interface ScoredFile {
   reasons: string[];
 }
 
+export interface SelectOptions {
+  /** Aplica busca semântica como sinal extra (default: false). */
+  semantic?: boolean;
+}
+
 const lowerCache = new Map<string, { src: string; lower: string }>();
 function lowerOf(rel: string, content: string): string {
   const c = lowerCache.get(rel);
@@ -100,7 +104,6 @@ function lowerOf(rel: string, content: string): string {
   return lower;
 }
 
-/** Quantas vezes `t` aparece no texto (limitado, só para ranquear). */
 function countHits(hay: string, t: string, cap = 20): number {
   let n = 0, i = 0;
   while (n < cap && (i = hay.indexOf(t, i)) !== -1) { n++; i += t.length; }
@@ -133,7 +136,6 @@ function scoreOne(tokens: string[], rel: string, entry: FileEntry, content?: str
       reasons.push(`resumo:${t}`);
       hit = true;
     }
-    // Conteúdo do arquivo: pega pedidos que não casam com nenhum nome/símbolo.
     if (content && t.length >= 3) {
       const n = countHits(lowerOf(rel, content), t);
       if (n > 0) {
@@ -162,7 +164,8 @@ export function selectFiles(
   query: string,
   index: IndexData,
   maxFiles = 40,
-  contents?: ReadonlyMap<string, string>
+  contents?: ReadonlyMap<string, string>,
+  opts: SelectOptions = {}
 ): ScoredFile[] {
   const base = tokenize(query);
   if (base.length === 0) return overviewFiles(index, maxFiles);
@@ -175,13 +178,13 @@ export function selectFiles(
     else scores.set(rel, { path: rel, score: pts, reasons: [reason] });
   };
 
-  // 1) texto literal (tokens originais valem mais que os expandidos)
+  // 1) texto literal
   for (const rel of Object.keys(index.files)) {
     const scored = scoreOne(tokens, rel, index.files[rel], contents?.get(rel));
     if (scored.score > 0) scores.set(rel, scored);
   }
 
-  // 2) pastas do conceito (ex.: "telas" -> tudo em pages/, exceto api)
+  // 2) pastas do conceito
   const lowerPaths = Object.keys(index.files);
   for (const rel of lowerPaths) {
     const l = rel.toLowerCase();
@@ -194,9 +197,30 @@ export function selectFiles(
       }
     }
   }
+
+  // 2.5) busca semântica (opt-in): mais um sinal, não substitui o textual
+  if (opts.semantic && contents) {
+    const sem = semanticSearch(query, index, contents, Math.max(maxFiles * 2, 80));
+    for (const f of sem.files) {
+      const cur = scores.get(f.path);
+      if (cur) {
+        cur.score += f.score * 0.6;
+        for (const r of f.reasons) {
+          if (cur.reasons.length < 6 && !cur.reasons.includes(r)) cur.reasons.push(r);
+        }
+      } else {
+        scores.set(f.path, {
+          path: f.path,
+          score: f.score * 0.6,
+          reasons: [...f.reasons]
+        });
+      }
+    }
+  }
+
   if (scores.size === 0) return overviewFiles(index, maxFiles);
 
-  // 3) dependências: segue imports até 2 níveis (o que a tela usa), e quem importa a tela
+  // 3) dependências
   const reverse = buildReverse(index);
   const seeds = [...scores.values()].sort((a, b) => b.score - a.score).slice(0, broad ? 30 : 10);
   for (const { path, score } of seeds) {
@@ -216,7 +240,6 @@ export function selectFiles(
   const limit = broad ? Math.max(maxFiles, 40) : maxFiles;
   const ranked = [...scores.values()].sort((a, b) => b.score - a.score).slice(0, limit);
 
-  // Poucos acertos = pedido vago: completa com a visão geral do projeto.
   if (ranked.length < 4) {
     const have = new Set(ranked.map(r => r.path));
     for (const o of overviewFiles(index, 12)) if (!have.has(o.path)) ranked.push(o);
@@ -224,10 +247,6 @@ export function selectFiles(
   return ranked;
 }
 
-/**
- * Fallback para pedidos que não casam com nada: arquivos "de entrada"
- * (README, manifests, main/index/extension) e os mais importados (hubs).
- */
 export function overviewFiles(index: IndexData, maxFiles = 15): ScoredFile[] {
   const reverse = buildReverse(index);
   const out: ScoredFile[] = [];
@@ -269,7 +288,6 @@ export function buildSelectiveContext(
   const fullBudget = Math.floor(maxChars * 0.9);
   const skeletonBudget = maxChars - fullBudget;
 
-  // Mantém a ordem de relevância recebida; só arquivos enormes viram esqueleto.
   const ordered = [...new Set(paths)];
 
   let fullText = '';

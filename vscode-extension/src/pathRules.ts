@@ -1,5 +1,13 @@
 import * as path from 'path';
 
+/**
+ * Regras por NOME de arquivo/pasta (sensível, excluído, extensão de texto).
+ *
+ * A validação da FORMA do caminho (absoluto, traversal, escape por symlink) fica
+ * em ./security/pathValidator.ts. Este módulo não resolve caminhos — só olha o
+ * caminho relativo já validado e aplica as regras de nomes aqui definidas.
+ */
+
 /** Pastas que nunca entram no contexto e nunca podem ser alteradas pelo chat. */
 export const EXCLUDED_DIRS = new Set([
     // Dependências / build / VCS

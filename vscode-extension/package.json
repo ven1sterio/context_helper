@@ -128,7 +128,7 @@
     "watch": "tsc -watch -p ./",
     "build": "tsc -p ./",
     "test:graph": "npm run compile && node test/graph.smoke.js",
-    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js"
+    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

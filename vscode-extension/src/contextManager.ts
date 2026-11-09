@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { EXCLUDED_DIRS, isExcludedPath, isProbablyBinary } from './pathRules';
+import { ContextBudget } from './intelligence/contextBudget';
+import { IndexData } from './indexer';
 
 export type ChangeKind = 'changed' | 'deleted';
 
@@ -31,15 +33,13 @@ interface TreeNode {
 }
 
 export class ContextManager {
-    private files = new Map<string, string>();   // caminho relativo -> conteúdo (texto)
-    private allPaths = new Set<string>();         // todos os arquivos visíveis (alimenta a tree)
+    private files = new Map<string, string>();
+    private allPaths = new Set<string>();
     private disposables: vscode.Disposable[] = [];
 
     private readonly _onDidChange = new vscode.EventEmitter<ChangeEvent>();
     private readonly _onDidChangeTree = new vscode.EventEmitter<void>();
-    /** Conteúdo de um arquivo mudou ou ele foi removido. */
     readonly onDidChange = this._onDidChange.event;
-    /** A estrutura de arquivos mudou (arquivo criado ou removido). */
     readonly onDidChangeTree = this._onDidChangeTree.event;
 
     constructor(private workspaceRoot: string) {}
@@ -54,12 +54,10 @@ export class ContextManager {
         return kb * 1024;
     }
 
-    /** Conteúdo em memória de um arquivo (ou undefined se não estiver no índice). */
     getFile(rel: string): string | undefined {
         return this.files.get(rel);
     }
 
-    /** Visão somente leitura do mapa de arquivos (para o Indexer). */
     getAllFiles(): ReadonlyMap<string, string> {
         return this.files;
     }
@@ -90,9 +88,8 @@ export class ContextManager {
 
         try {
             const stat = await vscode.workspace.fs.stat(uri);
-            if (!(stat.type & vscode.FileType.File)) return; // pasta, etc.
+            if (!(stat.type & vscode.FileType.File)) return;
 
-            // A tree mostra TODOS os arquivos visíveis (texto ou binário)
             this.addPath(rel, notify);
 
             if (stat.size > this.maxFileBytes) {
@@ -107,7 +104,7 @@ export class ContextManager {
             }
 
             const content = Buffer.from(bytes).toString('utf8');
-            if (this.files.get(rel) === content) return; // nada mudou de fato
+            if (this.files.get(rel) === content) return;
 
             this.files.set(rel, content);
             if (notify) this._onDidChange.fire({ relPath: rel, kind: 'changed' });
@@ -137,7 +134,6 @@ export class ContextManager {
         if (!rel) return;
         this.removeFile(rel, true);
         this.removePath(rel, true);
-        // Se foi uma pasta, remove tudo que estava dentro dela
         const prefix = rel + '/';
         for (const key of [...this.files.keys()]) {
             if (key.startsWith(prefix)) this.removeFile(key, true);
@@ -147,7 +143,6 @@ export class ContextManager {
         }
     }
 
-    /** Estrutura de pastas/arquivos (só nomes) em formato de árvore indentada. */
     buildTree(): string {
         const root: TreeNode = { dirs: new Map(), files: [] };
         for (const p of [...this.allPaths].sort()) {
@@ -184,7 +179,6 @@ export class ContextManager {
         return lines.join('\n');
     }
 
-    /** Contexto completo (primeiro envio ou reenvio forçado). */
     buildFull(): FullResult {
         const max = this.maxTotalChars;
         let text = '';
@@ -208,7 +202,29 @@ export class ContextManager {
         return { text, files, chars: text.length, omitted };
     }
 
-    /** Apenas o que mudou desde o último envio daquela conexão. */
+    /**
+     * Contexto completo ordenado por importância, com orçamento de tokens.
+     * Entradas priorizam entry points, configs, READMEs e hubs; o resto vai até
+     * o limite. Requer o índice (IndexData) para conhecer os tamanhos.
+     */
+    buildFullWithBudget(maxTokens: number, index: IndexData): FullResult {
+        const budget = new ContextBudget(index);
+        const { ordered, omitted } = budget.compute(maxTokens);
+        let text = '';
+        let files = 0;
+        for (const f of ordered) {
+            const content = this.files.get(f.path);
+            if (content === undefined) continue;
+            text += `\n--- ${f.path} ---\n${content}\n`;
+            files++;
+        }
+        if (omitted.length > 0) {
+            text += `\n[Omitidos por orçamento (${omitted.length}): ${omitted.slice(0, 80).join(', ')}]\n`;
+            text += `[Aumente "deepseekContextSync.maxContextTokens" ou "maxTotalKB" para incluir mais.]\n`;
+        }
+        return { text, files, chars: text.length, omitted };
+    }
+
     buildDelta(pending: Map<string, ChangeKind>): DeltaResult {
         const max = this.maxTotalChars;
         let text = '';
@@ -220,7 +236,6 @@ export class ContextManager {
                 ? `\n--- REMOVIDO: ${rel} ---\n`
                 : `\n--- ALTERADO: ${rel} ---\n${content}\n`;
 
-            // O que não couber fica pendente para o próximo clique
             if (included.length > 0 && text.length + block.length > max) continue;
 
             text += block;

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ApplyResult, PlannedFile, planFiles, countLines, isSuspiciousShrink } from './applyPlan';
+import { ApplyTransaction } from './applyTransaction';
 import { looksSensitive } from './pathRules';
 
 const SCHEME = 'deepseek-proposed';
@@ -201,29 +202,54 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         }
     }
 
+    /**
+     * Aplica o plano como transação. Se alguma escrita falhar, todos os
+     * arquivos já gravados são restaurados (rollback) e devolve erro.
+     * O backup em `.deepseek-sync/backup/` continua sendo feito antes.
+     */
     private async write(entries: Entry[], skipped: string[] = [], warnings: string[] = []): Promise<ApplyResult> {
-        const edit = new vscode.WorkspaceEdit();
-
-        for (const e of entries) {
-            if (e.doc) {
-                const full = new vscode.Range(e.doc.positionAt(0), e.doc.positionAt(e.doc.getText().length));
-                edit.replace(e.uri, full, e.file.content);
+        const writeFn = async (abs: string, content: string) => {
+            const uri = vscode.Uri.file(abs);
+            await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(abs)));
+            let doc: vscode.TextDocument | undefined;
+            try { doc = await vscode.workspace.openTextDocument(uri); } catch { doc = undefined; }
+            if (doc) {
+                const edit = new vscode.WorkspaceEdit();
+                const full = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
+                edit.replace(uri, full, content);
+                const ok = await vscode.workspace.applyEdit(edit);
+                if (!ok) throw new Error(`applyEdit recusou ${abs}`);
+                if (doc.isDirty) {
+                    const saved = await doc.save();
+                    if (!saved) throw new Error(`save falhou em ${abs}`);
+                }
             } else {
-                await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(e.file.abs)));
-                edit.createFile(e.uri, { ignoreIfExists: true });
-                edit.insert(e.uri, new vscode.Position(0, 0), e.file.content);
+                await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
             }
+        };
+
+        const verifyFn = async (abs: string, expected: string) => {
+            try {
+                const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(abs));
+                return Buffer.from(bytes).toString('utf8') === expected;
+            } catch {
+                return false;
+            }
+        };
+
+        const tx = new ApplyTransaction(this.workspaceRoot, writeFn, verifyFn);
+        const result = await tx.run(entries.map(e => e.file));
+        if (!result.ok) {
+            return {
+                status: 'error',
+                message: result.error || 'Transação falhou.',
+                files: [],
+                skipped,
+                warnings
+            };
         }
 
-        const ok = await vscode.workspace.applyEdit(edit);
-        if (!ok) return { status: 'error', message: 'O VS Code recusou a edição.' };
-
-        for (const e of entries) {
-            const doc = await vscode.workspace.openTextDocument(e.uri);
-            if (doc.isDirty) await doc.save();
-        }
-
-        const names = entries.map(e => e.file.rel);
+        const names = result.applied;
         const shown = names.length <= 3
             ? names.join(', ')
             : `${names.slice(0, 3).join(', ')} e mais ${names.length - 3}`;

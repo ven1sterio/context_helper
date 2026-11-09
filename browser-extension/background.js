@@ -15,11 +15,10 @@ chrome.runtime.onConnect.addListener(port => {
         if (started) return;
         started = true;
 
-        let url = WS_URL;
-        if (token) url += '?token=' + encodeURIComponent(token);
-
+        // O token NÃO vai mais na URL: enviamos como primeira mensagem do
+        // protocolo de autenticação (evita o token aparecer em logs/histórico).
         try {
-            sock = new WebSocket(url);
+            sock = new WebSocket(WS_URL);
         } catch {
             safePost({ t: 'close' });
             return;
@@ -27,6 +26,9 @@ chrome.runtime.onConnect.addListener(port => {
 
         sock.onopen = () => {
             safePost({ t: 'open' });
+            if (token) {
+                try { sock.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
+            }
             // Evita o service worker ser suspenso enquanto há conexão aberta
             keepAlive = setInterval(() => {
                 if (sock.readyState === WebSocket.OPEN) sock.send('{"type":"ping"}');

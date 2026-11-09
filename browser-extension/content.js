@@ -76,6 +76,9 @@ let agentRunning = false;
 let agentIteration = 0;
 let agentPaused = false;
 let waitResolve = null;
+let currentMissionId = null;
+let currentRunId = null;
+let waitingMissionStart = null;
 let agentObjective = '';
 let agentTouched = new Set();
 let agentSuggestedNewChat = false;
@@ -214,6 +217,8 @@ function connect() {
             finishWaitingSelection(msg);
         } else if (msg.type === 'state') {
             finishWaitingState(msg);
+        } else if (msg.type === 'missionStarted') {
+            finishWaitingMissionStart(msg);
         } else if (msg.type === 'aborted') {
             console.debug('[DeepSeek Sync] VS Code confirmou abort.');
         } else if (msg.type === 'error') {
@@ -658,7 +663,28 @@ async function waitForResponseComplete(timeoutMs, baseline, askExtend) {
     }
 }
 
-function sendApplyAndRun(files) {
+function finishWaitingMissionStart(msg) {
+    if (!waitingMissionStart) return;
+    clearTimeout(waitingMissionStart.timer);
+    const resolve = waitingMissionStart.resolve;
+    waitingMissionStart = null;
+    resolve(msg);
+}
+
+function sendStartMission(title, objective) {
+    return new Promise((resolve) => {
+        if (!isOpen()) { resolve(null); return; }
+        if (waitingMissionStart) { resolve(null); return; }
+        const timer = setTimeout(
+            () => finishWaitingMissionStart({ error: 'Timeout aguardando startMission.' }),
+            10000
+        );
+        waitingMissionStart = { resolve, timer };
+        ws.send(JSON.stringify({ type: 'startMission', title, objective }));
+    });
+}
+
+function sendApplyAndRun(files, opts = {}) {
     return new Promise((resolve) => {
         if (!isOpen()) { resolve(null); return; }
         if (waitingApplyResult) { resolve(null); return; }
@@ -666,7 +692,15 @@ function sendApplyAndRun(files) {
             finishWaitingApply({ status: 'error', message: 'Timeout aguardando VS Code (apply+run).' });
         }, currentTimeouts.apply * 1000);
         waitingApplyResult = { resolve, timer };
-        ws.send(JSON.stringify({ type: 'applyFiles', files, autoApply: true, runAfter: true }));
+        ws.send(JSON.stringify({
+            type: 'applyFiles',
+            files,
+            autoApply: true,
+            runAfter: true,
+            missionId: opts.missionId || undefined,
+            runId: opts.runId || undefined,
+            modelStatus: opts.modelStatus || null
+        }));
     });
 }
 
@@ -675,9 +709,18 @@ function sendApplyAndRun(files) {
 function stopAgent() {
     agentRunning = false;
     resolveWaitMore(false);
-    try { if (isOpen()) ws.send(JSON.stringify({ type: 'abort' })); } catch { /* ignore */ }
+    try {
+        if (isOpen()) {
+            ws.send(JSON.stringify({ type: 'abort' }));
+            if (currentRunId) {
+                ws.send(JSON.stringify({ type: 'cancelRun', reason: 'usuário parou o agente' }));
+            }
+        }
+    } catch { /* ignore */ }
     finishWaitingApply({ status: 'cancelled', message: 'Agente parado pelo usuário.' });
     toast('⏹ Agente parado.');
+    currentMissionId = null;
+    currentRunId = null;
     updateUI();
 }
 
@@ -703,6 +746,17 @@ async function startAgent() {
     agentObjective = question;
     agentTouched = new Set();
     agentSuggestedNewChat = false;
+    currentMissionId = null;
+    currentRunId = null;
+
+    // Fase 2: cria a missão no VS Code (run fica registrada em current-run.json)
+    try {
+        const started = await sendStartMission(question.slice(0, 200), question);
+        if (started && started.missionId && started.runId) {
+            currentMissionId = started.missionId;
+            currentRunId = started.runId;
+        }
+    } catch { /* segue com o fluxo antigo se startMission falhar */ }
 
     // Fase 5 — schema do state.md: Objetivo / Plano / Funciona / Quebrado /
     // Decisões / Rollbacks / Última falha / Arquivos tocados.
@@ -833,13 +887,84 @@ async function agentLoop(initialQuestion) {
         }
 
         toast(`🛠️ Aplicando ${parsed.files.length} operação(ões) e executando...`);
-        const res = await sendApplyAndRun(parsed.files);
+        const res = await sendApplyAndRun(parsed.files, {
+            missionId: currentMissionId,
+            runId: currentRunId,
+            modelStatus: status
+        });
         if (!res) { toast('VS Code não respondeu.'); return; }
         if (res.status === 'cancelled') { toast('Aplicação cancelada.'); return; }
 
         const touchedNow = (res.files && Array.isArray(res.files)) ? res.files : [];
         for (const f of touchedNow) agentTouched.add(f);
 
+        const dur = res.runDurationMs ? ` (${(res.runDurationMs / 1000).toFixed(1)}s)` : '';
+
+        // ---------- Fase 2: decisão vem do VS Code (RunManager) ----------
+        if (res.nextAction) {
+            const it = res.iteration || {};
+
+            if (res.nextAction === 'stop') {
+                toast(`⏹ ${res.nextReason || 'Agente parado pelo VS Code.'}`);
+                pushState({
+                    touched: [...agentTouched],
+                    lastFailure: res.nextReason || 'parado pelo VS Code',
+                    broken: [res.nextReason || 'agente parado']
+                });
+                currentMissionId = null;
+                currentRunId = null;
+                return;
+            }
+
+            if (res.nextAction === 'done') {
+                pushState({
+                    touched: [...agentTouched],
+                    working: [`Etapa ${stages + 1} aplicada e build OK${dur}`],
+                    decisions: [`Agente concluiu ${stages + 1} etapa(s).`],
+                    lastFailure: ''
+                });
+                toast(`✅ Agente concluiu! ${stages + 1} etapa(s) aplicada(s)${dur}`);
+                currentMissionId = null;
+                currentRunId = null;
+                return;
+            }
+
+            if (res.nextAction === 'retry') {
+                failures++;
+                let lastFailure;
+                if (it.status === 'applied-build-failed') {
+                    lastFailure = `Build falhou (exit ${it.runExitCode ?? '?'}). Comando: ${it.runCommand || '(desconhecido)'}.`;
+                } else if (it.errors && it.errors.length > 0) {
+                    lastFailure = it.errors[0];
+                } else {
+                    lastFailure = 'falha na iteração';
+                }
+                pushState({
+                    touched: [...agentTouched],
+                    lastFailure,
+                    broken: [it.status === 'applied-build-failed'
+                        ? `Build falhou na etapa ${stages + 1}: ${(it.runOutputTail || '').slice(-300)}`
+                        : 'aplicação falhou']
+                });
+                await humanDelay(HUMAN_DELAY.afterFailure);
+                promptText = res.nextPrompt || 'Reenvie a etapa corrigida.';
+                continue;
+            }
+
+            // nextAction === 'continue'
+            failures = 0;
+            stages++;
+            pushState({
+                touched: [...agentTouched],
+                working: [`Etapa ${stages} aplicada e build OK${dur}`],
+                lastFailure: ''
+            });
+            if (status === 'continue') toast(`✔ Etapa ${stages} aplicada${dur}. Pedindo a próxima...`);
+            promptText = res.nextPrompt || 'Continue com a próxima etapa.';
+            continue;
+        }
+
+        // ---------- Fallback: VS Code antigo (sem RunManager) ----------
         if (res.status === 'error') {
             failures++;
             pushState({
@@ -875,8 +1000,6 @@ async function agentLoop(initialQuestion) {
 
         failures = 0;
         stages++;
-        const dur = res.runDurationMs ? ` (${(res.runDurationMs / 1000).toFixed(1)}s)` : '';
-
         pushState({
             touched: [...agentTouched],
             working: [`Etapa ${stages} aplicada e build OK${dur}`],
@@ -895,7 +1018,6 @@ async function agentLoop(initialQuestion) {
             continue;
         }
 
-        // Concluído: o agente marca a decisão final em `decisions`.
         pushState({
             decisions: [`Agente concluiu ${stages} etapa(s).`]
         });

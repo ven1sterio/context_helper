@@ -1,5 +1,6 @@
 import * as path from 'path';
 import { isExcludedPathForWrite } from './pathRules';
+import { validatePath } from './security/pathValidator';
 
 export interface ApplyResult {
     status: 'applied' | 'cancelled' | 'error';
@@ -297,16 +298,9 @@ export function planFiles(
             return fail('Caminho de arquivo ausente.');
         }
 
-        const rawPath = item.filePath.trim().replace(/\\/g, '/').replace(/^\.\//, '');
-        if (!rawPath || rawPath.includes('\0') || rawPath.endsWith('/')) return fail(`Caminho inválido: "${item.filePath}"`);
-        if (rawPath.startsWith('/') || /^[a-zA-Z]:/.test(rawPath)) return fail(`Caminho absoluto não permitido: ${rawPath}`);
-        if (rawPath.split('/').some(seg => seg === '..')) return fail(`Caminho fora do projeto: ${rawPath}`);
-
-        const abs = path.resolve(root, rawPath);
-        const check = path.relative(root, abs);
-        if (!check || check.startsWith('..') || path.isAbsolute(check)) return fail(`Caminho fora do projeto: ${rawPath}`);
-
-        const rel = check.split(path.sep).join('/');
+        const validated = validatePath(item.filePath, root);
+        if (!validated.ok) return fail(validated.error);
+        const { rel, abs } = validated;
         if (isExcludedPathForWrite(rel)) return fail(`Caminho protegido (não pode ser alterado pelo chat): ${rel}`);
 
         if (item.isEdit) {

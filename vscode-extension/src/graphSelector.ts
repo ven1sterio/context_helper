@@ -6,6 +6,10 @@ export interface GraphSelectOptions {
     hops?: number;            // profundidade da expansão (padrão 2)
     graphWeight?: number;     // peso do grafo na mistura (padrão 1)
     localWeight?: number;     // peso da busca local (padrão 0.6)
+    /** Bônus para arquivos que (transitivamente) importam os top selecionados. */
+    impactBonus?: number;
+    /** Callback: dado um arquivo, devolve quem o importa (vem do Indexer). */
+    dependentsOf?: (rel: string) => string[];
 }
 
 export interface GraphSelection {
@@ -113,7 +117,29 @@ export function selectWithGraph(
         }
     }
 
-    // 5) sementes sempre entram; resto por score
+    // 5a) bônus de impacto: top arquivos "puxam" quem os importa
+    if (opts.impactBonus && opts.impactBonus > 0 && opts.dependentsOf) {
+        const topPaths = [...merged.values()]
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5)
+            .map(f => f.path);
+        const seen = new Set<string>();
+        for (const p of topPaths) {
+            for (const dep of opts.dependentsOf(p)) {
+                if (seen.has(dep)) continue;
+                seen.add(dep);
+                const cur = merged.get(dep);
+                if (cur) {
+                    cur.score += opts.impactBonus;
+                    if (cur.reasons.length < 5 && !cur.reasons.includes(`importa ${p}`)) {
+                        cur.reasons.push(`importa ${p}`);
+                    }
+                }
+            }
+        }
+    }
+
+    // 5b) sementes sempre entram; resto por score
     const ranked = [...merged.values()].sort((a, b) => b.score - a.score);
     const out: ScoredFile[] = [];
     const taken = new Set<string>();

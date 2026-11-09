@@ -1,17 +1,13 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { ProjectMemory } from './memory/projectMemory';
 
 const DIR = '.deepseek-sync';
 const FILE = 'state.md';
 const MAX_LIST = 20;
 const MAX_TOUCHED = 40;
 
-/**
- * Campos que o código escreve automaticamente em `.deepseek-sync/state.md`.
- * `decisions` e `rollbacks` são mantidos pelo usuário (o código não toca neles
- * se o patch não os incluir — preserva o que você digitou).
- */
 export interface StateUpdate {
     objective?: string;
     plan?: string[];
@@ -58,29 +54,21 @@ function parseList(buf: string): string[] {
         .filter(l => l.length > 0);
 }
 
-/**
- * Persiste um resumo curto do estado do projeto em `.deepseek-sync/state.md`.
- *
- * O arquivo segue o esqueleto:
- *   # Estado do projeto
- *   ## Objetivo        (automático)
- *   ## Plano           (manual / agente)
- *   ## Funciona        (automático)
- *   ## Quebrado        (automático)
- *   ## Decisões        (manual — preservado)
- *   ## Rollbacks       (manual — preservado)
- *   ## Última falha    (automático)
- *   ## Arquivos tocados (automático)
- *
- * Preserva conteúdo manual dos cabeçalhos existentes ao recarregar. Gravação
- * atômica (tmp + rename), com debounce de 1 s.
- */
 export class StateManager implements vscode.Disposable {
     private state: StoredState = emptyState();
     private dirty = false;
     private saveTimer: NodeJS.Timeout | null = null;
+    private memory?: ProjectMemory;
 
     constructor(private workspaceRoot: string) {}
+
+    /**
+     * Anexa a memória de projeto (Fase 3). `toMarkdown()` continua devolvendo
+     * só o state.md; `toMarkdownWithMemory()` concatena o resumo da memória.
+     */
+    setMemory(memory: ProjectMemory): void {
+        this.memory = memory;
+    }
 
     get filePath(): string {
         return path.join(this.workspaceRoot, DIR, FILE);
@@ -140,7 +128,6 @@ export class StateManager implements vscode.Disposable {
                 section = h[1].trim().toLowerCase();
                 continue;
             }
-            // Ignora o "# Estado do projeto" e o "_Atualizado em …_".
             if (/^#\s+/.test(line)) continue;
             if (/^_.*_$/.test(line.trim())) continue;
             buf.push(line);
@@ -180,7 +167,6 @@ export class StateManager implements vscode.Disposable {
         this.scheduleSave();
     }
 
-    /** Markdown com todos os cabeçalhos do esqueleto (mesmo quando vazios). */
     toMarkdown(): string {
         const s = this.state;
         const parts: string[] = [];
@@ -228,6 +214,18 @@ export class StateManager implements vscode.Disposable {
         parts.push('');
 
         return parts.join('\n').trim() + '\n';
+    }
+
+    /**
+     * state.md + resumo da memória. Usado pelo `getState` do wsServer.
+     * Sem memória anexada, é idêntico a `toMarkdown()`.
+     */
+    toMarkdownWithMemory(): string {
+        const base = this.toMarkdown();
+        if (!this.memory) return base;
+        const summary = this.memory.toContextSummary();
+        if (!summary || summary.trim().length === 0) return base;
+        return base.trimEnd() + '\n\n---\n\n' + summary + '\n';
     }
 
     private scheduleSave(): void {

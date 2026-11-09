@@ -354,6 +354,7 @@ export class Indexer implements vscode.Disposable {
     updateFile(rel: string, content: string): void {
         if (!this.ready) { this.queued.push({ op: 'update', rel, content }); return; }
         if (isExcludedPath(rel)) return;
+        this._reverseCache = null;
         const allPaths = this.collectAllPaths();
         const newEntry = buildEntry(rel, content, allPaths);
         const old = this.index.files[rel];
@@ -365,6 +366,7 @@ export class Indexer implements vscode.Disposable {
 
     removeFile(rel: string): void {
         if (!this.ready) { this.queued.push({ op: 'remove', rel }); return; }
+        this._reverseCache = null;
         let changed = false;
         if (this.index.files[rel]) { delete this.index.files[rel]; changed = true; }
         const prefix = rel.endsWith('/') ? rel : rel + '/';
@@ -405,7 +407,10 @@ export class Indexer implements vscode.Disposable {
         return this.provider?.getFile(rel);
     }
 
+    private _reverseCache: Map<string, string[]> | null = null;
+
     getReverseImports(): Map<string, string[]> {
+        if (this._reverseCache) return this._reverseCache;
         const reverse = new Map<string, string[]>();
         for (const [rel, entry] of Object.entries(this.index.files)) {
             for (const imp of entry.imports) {
@@ -414,7 +419,18 @@ export class Indexer implements vscode.Disposable {
                 reverse.set(imp, list);
             }
         }
+        this._reverseCache = reverse;
         return reverse;
+    }
+
+    /** Conveniência: imports resolvidos de um arquivo. */
+    getImports(rel: string): string[] {
+        return this.index.files[rel]?.imports ?? [];
+    }
+
+    /** Conveniência: arquivos que importam `rel`. */
+    getDependentsOf(rel: string): string[] {
+        return this.getReverseImports().get(rel) ?? [];
     }
 
     private scheduleSave(): void {

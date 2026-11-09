@@ -8,6 +8,12 @@ import { Indexer } from './indexer';
 import { GraphStore } from './graphStore';
 import { StateManager } from './stateManager';
 import { setAllowSensitive, maskSecrets } from './pathRules';
+import { PlanManager } from './agent/planManager';
+import { TaskQueue } from './agent/taskQueue';
+import { RunManager } from './agent/runManager';
+import { RunHistory } from './agent/runHistory';
+import { RecoveryManager } from './agent/recoveryManager';
+import { ProjectMemory } from './memory/projectMemory';
 
 const TOKEN_KEY = 'deepseekContextSync.token';
 
@@ -54,6 +60,11 @@ async function activateInternal(context: vscode.ExtensionContext) {
     const stateManager = new StateManager(workspaceRoot);
     await stateManager.initialize();
 
+    // ---------- Fase 3: memória estruturada ----------
+    const projectMemory = new ProjectMemory(workspaceRoot);
+    await projectMemory.load();
+    stateManager.setMemory(projectMemory);
+
     const applyManager = new ApplyManager(workspaceRoot);
     const taskRunner = new TaskRunner(workspaceRoot);
 
@@ -90,6 +101,50 @@ async function activateInternal(context: vscode.ExtensionContext) {
     );
     wsServer.setGraphStore(graphStore);
     wsServer.setStateManager(stateManager);
+
+    // ---------- Fase 2: Full Code 2.0 ----------
+    const planManager = new PlanManager(workspaceRoot);
+    const taskQueue = new TaskQueue(planManager);
+    const runHistory = new RunHistory(workspaceRoot);
+    const recoveryManager = new RecoveryManager(workspaceRoot);
+    const runManager = new RunManager(planManager, taskQueue, runHistory, recoveryManager);
+
+    wsServer.setAgentManagers({
+        plan: planManager,
+        queue: taskQueue,
+        run: runManager,
+        recovery: recoveryManager
+    });
+
+    // Recovery: verifica run interrompida ao ativar
+    try {
+        const recovery = await recoveryManager.inspect();
+        if (recovery.kind === 'running') {
+            const choice = await vscode.window.showInformationMessage(
+                `DeepSeek Context Sync: há uma execução interrompida (${recovery.run.id}). Retomar?`,
+                'Retomar',
+                'Descartar'
+            );
+            if (choice === 'Retomar') {
+                if (recovery.mission) {
+                    await planManager.load(recovery.run.missionId);
+                }
+                await runManager.resumeFrom(recovery.run);
+                vscode.window.showInformationMessage(
+                    'Execução retomada. Abra o chat e clique em "🔁 Full Code" para continuar.'
+                );
+            } else {
+                await recoveryManager.saveCurrentRun(null);
+            }
+        } else if (recovery.kind === 'stale') {
+            vscode.window.showWarningMessage(
+                `DeepSeek Context Sync: execução interrompida não pode ser retomada (${recovery.reason}).`
+            );
+            await recoveryManager.saveCurrentRun(null);
+        }
+    } catch (e) {
+        console.error('[DeepSeek Context Sync] recovery:', e);
+    }
 
     const indexSub = contextManager.onDidChange(e => {
         if (e.kind === 'deleted') indexer.removeFile(e.relPath);
@@ -138,7 +193,9 @@ async function activateInternal(context: vscode.ExtensionContext) {
         dispose: () => {
             cfgSub.dispose();
             indexSub.dispose();
+            projectMemory.dispose();
             stateManager.dispose();
+            planManager.dispose();
             indexer.dispose();
             contextManager.dispose();
             applyManager.dispose();
@@ -148,13 +205,6 @@ async function activateInternal(context: vscode.ExtensionContext) {
     });
 }
 
-/**
- * Chamado quando a janela do Extension Development Host (ou do VS Code) fecha.
- * Os disposables em `context.subscriptions` já fazem a limpeza; exportar
- * `deactivate` garante que o Extension Host encerre sem deixar a porta 8765
- * presa — o que fazia o próximo F5 abrir e fechar a janela até o processo
- * antigo morrer e liberar a porta.
- */
 export function deactivate() {
     // No-op intencional: a limpeza real está em context.subscriptions.dispose().
 }
