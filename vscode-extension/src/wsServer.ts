@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { URL } from 'url';
 import { ContextManager, ChangeKind } from './contextManager';
 import { ApplyResult } from './applyPlan';
 import { TaskRunner } from './taskRunner';
@@ -17,6 +17,13 @@ import { TaskQueue } from './agent/taskQueue';
 import { RunManager, AdvanceResult } from './agent/runManager';
 import { RecoveryManager } from './agent/recoveryManager';
 import { IterationRecord } from './agent/agentTypes';
+import { hashContent, fingerprintFile } from './fileFingerprint';
+import { AgentRegistry } from './multiagent/agentRegistry';
+import { MissionController } from './multiagent/missionController';
+import { DeliverableManager } from './multiagent/deliverableManager';
+import { ReviewManager } from './multiagent/reviewManager';
+import { SessionRouter } from './multiagent/sessionRouter';
+import { TaskDispatcher } from './multiagent/taskDispatcher';
 
 export interface AgentManagers {
     plan: PlanManager;
@@ -25,8 +32,18 @@ export interface AgentManagers {
     recovery: RecoveryManager;
 }
 
+export interface MultiAgentManagers {
+    registry: AgentRegistry;
+    mission: MissionController;
+    deliverables: DeliverableManager;
+    reviews: ReviewManager;
+    sessions: SessionRouter;
+    dispatcher: TaskDispatcher;
+}
+
 export interface ApplyOptions {
     auto?: boolean;
+    conflicts?: string[];
 }
 
 export type ApplyHandler = (files: unknown, options?: ApplyOptions) => Promise<ApplyResult>;
@@ -55,6 +72,7 @@ export class WsServer {
     private lastSelectionInfo: { source: string; stale: number; report: string } = { source: 'local', stale: 0, report: '' };
     private stateManager?: StateManager;
     private agents?: AgentManagers;
+    private multiagent?: MultiAgentManagers;
     private abortRequested = false;
     private configSub: vscode.Disposable | null = null;
 
@@ -67,8 +85,6 @@ export class WsServer {
             port,
             host: '127.0.0.1',
             maxPayload,
-            // Token NÃO fica mais na URL. Só checamos a origem aqui; a
-            // autenticação por token acontece via AuthProtocol (primeiro frame).
             verifyClient: (info, cb) => {
                 const origin = (info.origin || (info.req.headers.origin as string | undefined) || '').trim();
                 if (!origin) { cb(true); return; }
@@ -94,6 +110,8 @@ export class WsServer {
             let treeDirty = false;
             let sentFull = false;
 
+            const sentFingerprints = new Map<string, string>();
+
             const subs = [
                 this.contextManager.onDidChange(e => { pending.set(e.relPath, e.kind); }),
                 this.contextManager.onDidChangeTree(() => { treeDirty = true; })
@@ -103,7 +121,47 @@ export class WsServer {
                 if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
             };
 
-            // ----- Autenticação (token fora da URL) -----
+            const registerFingerprint = (rel: string) => {
+                const content = this.contextManager.getFile(rel);
+                if (content !== undefined) sentFingerprints.set(rel, hashContent(content));
+            };
+
+            /** Despacha a próxima task pronta do MissionController e envia ao navegador. */
+            const sendNextDispatch = () => {
+                if (!this.multiagent) return;
+                const context = this.contextManager.buildFull().text;
+                const d = this.multiagent.mission.dispatchNext(context);
+                if (!d) {
+                    const plan = this.multiagent.mission.currentPlan;
+                    if (plan && plan.tasks.every(t => t.status === 'accepted' || t.status === 'failed')) {
+                        const { audit } = this.multiagent.mission.complete();
+                        send({
+                            type: 'multiAgentMissionCompleted',
+                            mission: this.multiagent.mission.currentPlan,
+                            audit
+                        });
+                    } else {
+                        // Sem próxima task pronta E missão ainda não concluída =
+                        // missão travada (ex.: nenhuma sessão de navegador). Sem
+                        // esse aviso o usuário ficava esperando em silêncio.
+                        send({
+                            type: 'multiAgentError',
+                            error: 'Missão sem próxima task pronta e ainda não concluída. ' +
+                                'Provavelmente nenhuma sessão de navegador está disponível ' +
+                                'ou há uma task bloqueada.'
+                        });
+                    }
+                    return;
+                }
+                send({
+                    type: 'nextTaskDispatch',
+                    contract: d.contract,
+                    prompt: d.prompt,
+                    agentLabel: d.agent.label,
+                    mission: this.multiagent.mission.currentPlan
+                });
+            };
+
             const auth = new AuthProtocol({
                 token: this.token,
                 onAuthenticated: () => {
@@ -122,7 +180,6 @@ export class WsServer {
                 try { msg = JSON.parse(raw.toString()); } catch { return; }
                 if (!msg || typeof msg !== 'object') return;
 
-                // Portão de autenticação
                 if (!auth.isAuthenticated()) {
                     auth.handleMessage(msg);
                     return;
@@ -219,6 +276,11 @@ export class WsServer {
                             const maxTokens = vscode.workspace.getConfiguration('deepseekContextSync')
                                 .get<number>('maxContextTokens', 120000);
                             const result = buildSelectiveContext(paths, maxTokens, this.contextManager.getAllFiles(), this.indexer.getIndex());
+
+                            for (const rel of [...result.included, ...result.skeleton]) {
+                                registerFingerprint(rel);
+                            }
+
                             send({
                                 type: 'selectionContext',
                                 data: (this.lastSelectionInfo.report
@@ -236,8 +298,20 @@ export class WsServer {
 
                     case 'request': {
                         if (m.mode === 'full' || !sentFull) {
-                            const r = this.contextManager.buildFull();
+                            const useBudget = vscode.workspace.getConfiguration('deepseekContextSync')
+                                .get<boolean>('useContextBudget', true);
+                            const r = (useBudget && this.indexer)
+                                ? this.contextManager.buildFullWithBudget(this.fullBudgetTokens(), this.indexer.getIndex())
+                                : this.contextManager.buildFull();
+
                             pending.clear(); treeDirty = false; sentFull = true;
+
+                            const omittedSet = new Set(r.omitted);
+                            for (const [rel] of this.contextManager.getAllFiles()) {
+                                if (omittedSet.has(rel)) continue;
+                                registerFingerprint(rel);
+                            }
+
                             send({
                                 type: 'context', mode: 'full', data: r.text,
                                 tree: this.contextManager.buildTree(),
@@ -247,6 +321,13 @@ export class WsServer {
                             const r = this.contextManager.buildDelta(pending);
                             for (const p of r.included) pending.delete(p);
                             const sendTree = treeDirty; treeDirty = false;
+
+                            for (const rel of r.included) {
+                                const content = this.contextManager.getFile(rel);
+                                if (content !== undefined) registerFingerprint(rel);
+                                else sentFingerprints.delete(rel);
+                            }
+
                             send({
                                 type: 'context',
                                 mode: (r.included.length > 0 || sendTree) ? 'delta' : 'empty',
@@ -266,9 +347,27 @@ export class WsServer {
                             this.abortRequested = false;
                             const startedAt = new Date().toISOString();
 
-                            const result = await this.applyHandler(m.files, { auto });
+                            const uniquePaths = new Set<string>();
+                            for (const it of m.files) {
+                                if (it && typeof it === 'object') {
+                                    const rel = (it as any).filePath;
+                                    if (typeof rel === 'string') uniquePaths.add(rel);
+                                }
+                            }
+                            const conflicts = this.detectConflicts([...uniquePaths], sentFingerprints);
 
-                            // Constrói o IterationRecord antes de decidir a próxima ação.
+                            if (conflicts.length > 0 && auto) {
+                                send({
+                                    type: 'applyResult',
+                                    status: 'error',
+                                    message: 'Conflito de arquivos:\n' + conflicts.join('\n'),
+                                    conflicts
+                                });
+                                return;
+                            }
+
+                            const result = await this.applyHandler(m.files, { auto, conflicts });
+
                             const iteration: IterationRecord = {
                                 index: (this.agents?.run.currentRun?.iterations.length ?? 0) + 1,
                                 startedAt,
@@ -283,6 +382,7 @@ export class WsServer {
                                 modelStatus: m.modelStatus
                             };
                             if (result.status === 'error') iteration.errors.push(result.message);
+                            if (conflicts.length > 0) iteration.errors.push(...conflicts.map(c => `conflito: ${c}`));
 
                             if (this.abortRequested) {
                                 iteration.status = 'cancelled';
@@ -321,7 +421,18 @@ export class WsServer {
                             }
                             iteration.endedAt = new Date().toISOString();
 
-                            // Delega a decisão ao RunManager (se disponível)
+                            if (result.status === 'applied' && result.files && result.files.length > 0) {
+                                const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+                                if (root) {
+                                    for (const rel of result.files) {
+                                        const abs = path.join(root, rel.split('/').join(path.sep));
+                                        const fp = fingerprintFile(abs);
+                                        if (fp) sentFingerprints.set(rel, fp);
+                                        else sentFingerprints.delete(rel);
+                                    }
+                                }
+                            }
+
                             let advance: AdvanceResult | null = null;
                             if (this.agents && m.missionId) {
                                 try {
@@ -341,7 +452,8 @@ export class WsServer {
                                 nextAction: advance?.action,
                                 nextReason: advance?.reason,
                                 nextPrompt: this.buildNextPrompt(advance, m.modelStatus, iteration),
-                                mission: advance?.mission ?? null
+                                mission: advance?.mission ?? null,
+                                conflicts: conflicts.length > 0 ? conflicts : undefined
                             };
                             if (runAfterResult) {
                                 response.runSuccess = runAfterResult.success;
@@ -396,6 +508,92 @@ export class WsServer {
                         });
                         return;
                     }
+
+                    case 'startMultiAgentMission': {
+                        if (!this.multiagent) { send({ type: 'multiAgentError', error: 'Multiagente não disponível.' }); return; }
+                        try {
+                            const plan = this.multiagent.mission.start({ title: m.title, objective: m.objective });
+                            send({ type: 'multiAgentMissionStarted', mission: plan });
+                            sendNextDispatch();
+                        } catch (e) {
+                            send({ type: 'multiAgentError', error: e instanceof Error ? e.message : String(e) });
+                        }
+                        return;
+                    }
+
+                    case 'dispatchNextTask': {
+                        if (!this.multiagent) { send({ type: 'multiAgentError', error: 'Multiagente não disponível.' }); return; }
+                        sendNextDispatch();
+                        return;
+                    }
+
+                    case 'submitDeliverable': {
+                        if (!this.multiagent) { send({ type: 'multiAgentError', error: 'Multiagente não disponível.' }); return; }
+                        try {
+                            const result = this.multiagent.mission.recordDelivery({
+                                taskId: m.taskId,
+                                files: m.files || [],
+                                summary: m.summary,
+                                knownIssues: m.knownIssues,
+                                buildPassed: m.buildPassed
+                            });
+                            send({
+                                type: 'deliverableRecorded',
+                                ...result,
+                                mission: this.multiagent.mission.currentPlan
+                            });
+                            // FIX BUG CRÍTICO: sempre tentar despachar a próxima
+                            // task pronta, INCLUSIVE após rejeição. Antes, o
+                            // servidor só despachava se `accepted === true`, então
+                            // qualquer rejeição do revisor travava a missão para
+                            // sempre (ninguém re-despachava o Dev para refazer).
+                            if (result.missionCompleted) {
+                                send({
+                                    type: 'multiAgentMissionCompleted',
+                                    mission: this.multiagent.mission.currentPlan,
+                                    audit: result.audit
+                                });
+                            } else {
+                                sendNextDispatch();
+                            }
+                        } catch (e) {
+                            send({ type: 'multiAgentError', error: e instanceof Error ? e.message : String(e) });
+                        }
+                        return;
+                    }
+
+                    case 'cancelMultiAgentMission': {
+                        if (!this.multiagent) { send({ type: 'multiAgentError', error: 'Multiagente não disponível.' }); return; }
+                        this.multiagent.mission.cancel(m.reason);
+                        send({ type: 'multiAgentMissionCancelled', mission: this.multiagent.mission.currentPlan });
+                        return;
+                    }
+
+                    case 'getMultiAgentState': {
+                        if (!this.multiagent) { send({ type: 'multiAgentState', mission: null }); return; }
+                        send({
+                            type: 'multiAgentState',
+                            mission: this.multiagent.mission.currentPlan,
+                            availability: this.multiagent.dispatcher.listAvailability(),
+                            sessions: this.multiagent.sessions.list()
+                        });
+                        return;
+                    }
+
+                    case 'registerSession': {
+                        if (this.multiagent) {
+                            this.multiagent.sessions.register(m.sessionId, m.provider as any);
+                        }
+                        send({ type: 'sessionRegistered', sessionId: m.sessionId });
+                        return;
+                    }
+
+                    case 'markSessionUnavailable': {
+                        if (this.multiagent) {
+                            this.multiagent.sessions.markAvailable(m.sessionId, false);
+                        }
+                        return;
+                    }
                 }
             });
 
@@ -406,10 +604,29 @@ export class WsServer {
         });
     }
 
-    /**
-     * Texto que o `content.js` usa como próximo prompt. Se `advance` for null
-     * (sem RunManager), devolve undefined e o content.js cai no fallback.
-     */
+    private detectConflicts(uniquePaths: string[], sentFingerprints: Map<string, string>): string[] {
+        const conflicts: string[] = [];
+        const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!root) return conflicts;
+        for (const rel of uniquePaths) {
+            const expected = sentFingerprints.get(rel);
+            if (!expected) continue;
+            const abs = path.join(root, rel.split('/').join(path.sep));
+            const current = fingerprintFile(abs);
+            if (current === null) {
+                conflicts.push(`${rel}: não existe mais no disco`);
+            } else if (current !== expected) {
+                conflicts.push(`${rel}: modificado no VS Code desde o último envio de contexto`);
+            }
+        }
+        return conflicts;
+    }
+
+    private fullBudgetTokens(): number {
+        const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 800);
+        return Math.max(2000, Math.floor(kb * 1024 / 4));
+    }
+
     private buildNextPrompt(
         advance: AdvanceResult | null,
         modelStatus: 'continue' | 'done' | null,
@@ -419,6 +636,12 @@ export class WsServer {
         if (advance.action === 'done' || advance.action === 'stop') return undefined;
 
         if (advance.action === 'retry') {
+            if (iteration.errors.some(e => e.startsWith('conflito:'))) {
+                return 'Conflito detectado: o arquivo mudou no VS Code desde o envio do contexto. ' +
+                    'Não sobrescreva sem ver o estado atual. Peça ao usuário para revisar ou reenvie ' +
+                    'a etapa depois de eu enviar o contexto atualizado.\n' +
+                    'Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].';
+            }
             if (iteration.status === 'apply-failed') {
                 return `Falha ao aplicar:\n${iteration.errors.join('\n')}\n\n` +
                     `Reenvie os arquivos corrigidos. Use "### FILE:" se o EDIT não casar. ` +
@@ -441,7 +664,6 @@ export class WsServer {
             return `Reenvie a etapa corrigida. Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
         }
 
-        // continue
         if (modelStatus === 'done') {
             return `Etapa concluída. Continue com a PRÓXIMA etapa do seu plano. ` +
                 `Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e depois [[FIM-DA-RESPOSTA]].`;
@@ -491,6 +713,7 @@ export class WsServer {
     setGraphStore(store: GraphStore) { this.graphStore = store; }
     setStateManager(mgr: StateManager) { this.stateManager = mgr; }
     setAgentManagers(m: AgentManagers) { this.agents = m; }
+    setMultiAgentManagers(m: MultiAgentManagers) { this.multiagent = m; }
     getToken(): string { return this.token; }
 
     dispose() {

@@ -19,6 +19,11 @@ interface Entry {
 
 export interface ApplyOptions {
     auto?: boolean;
+    /**
+     * Conflitos detectados pelo wsServer (arquivos que mudaram desde o envio
+     * do contexto). São exibidos no diálogo e no resultado.
+     */
+    conflicts?: string[];
 }
 
 export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.Disposable {
@@ -51,12 +56,15 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
         this.abortRequested = false;
 
-        // Modo parcial só com confirmação humana; o agente autônomo (auto) fica atômico.
         const mode = vscode.workspace.getConfiguration('deepseekContextSync').get<string>('applyMode', 'partial');
         const partial = !options.auto && mode === 'partial';
         const plan = planFiles(input, this.workspaceRoot, abs => this.readFileSync(abs), { partial, allowUnfenced: !options.auto });
         if (!plan.ok) return { status: 'error', message: plan.error };
-        const { skipped, warnings } = plan;
+        const { skipped } = plan;
+
+        // Conflitos vêm do wsServer e entram como avisos no diálogo.
+        const conflictWarnings = (options.conflicts ?? []).map(c => `⚠️ conflito: ${c}`);
+        const warnings = [...plan.warnings, ...conflictWarnings];
 
         this.busy = true;
         this.proposals.clear();
@@ -156,11 +164,6 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         return extra.length ? `${files}\n\n${extra.join('\n')}` : files;
     }
 
-    /**
-     * Grava uma cópia dos arquivos originais antes de aplicar, para permitir
-     * desfazer manualmente. Pasta: `.deepseek-sync/backup/<timestamp>/`.
-     * Mantém apenas os BACKUP_KEEP backups mais recentes.
-     */
     private async backup(entries: Entry[]): Promise<void> {
         const existing = entries.filter(e => e.doc);
         if (existing.length === 0) return;
@@ -178,7 +181,6 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
             } catch { /* ignore */ }
         }
 
-        // Rotação: mantém os N mais recentes.
         try {
             const all = (await fs.promises.readdir(root))
                 .filter(n => /^\d{4}-/.test(n))
@@ -256,6 +258,9 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         vscode.window.showInformationMessage(`✅ DeepSeek: ${names.length} arquivo(s) atualizado(s): ${shown}`);
         if (skipped.length) {
             vscode.window.showWarningMessage(`DeepSeek: ${skipped.length} edição(ões) ignorada(s):\n${skipped.join('\n')}`);
+        }
+        if (warnings.length) {
+            vscode.window.showWarningMessage(`DeepSeek: ${warnings.length} aviso(s):\n${warnings.join('\n')}`);
         }
         const tail = skipped.length ? ` ⚠️ ${skipped.length} edição(ões) ignorada(s): ${skipped.join(' | ')}` : '';
         return {

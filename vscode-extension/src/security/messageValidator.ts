@@ -32,6 +32,9 @@ export type ValidatedMessage =
         missionId?: string;
         runId?: string;
         modelStatus: 'continue' | 'done' | null;
+        taskId?: string;
+        role?: string;
+        summary?: string;
     }
     | { type: 'selectContext'; request: string }
     | { type: 'buildSelection'; paths: string[] }
@@ -39,7 +42,14 @@ export type ValidatedMessage =
     | { type: 'updateState'; patch: Record<string, unknown> }
     | { type: 'startMission'; title: string; objective: string }
     | { type: 'cancelRun'; reason: string }
-    | { type: 'getRun' };
+    | { type: 'getRun' }
+    | { type: 'startMultiAgentMission'; title: string; objective: string }
+    | { type: 'dispatchNextTask' }
+    | { type: 'submitDeliverable'; taskId: string; summary: string; knownIssues: string[]; buildPassed: boolean; files: string[] }
+    | { type: 'cancelMultiAgentMission'; reason: string }
+    | { type: 'getMultiAgentState' }
+    | { type: 'registerSession'; sessionId: string; provider: string }
+    | { type: 'markSessionUnavailable'; sessionId: string };
 
 export type ValidationResult =
     | { ok: true; message: ValidatedMessage }
@@ -121,6 +131,9 @@ export function validateMessage(raw: unknown): ValidationResult {
             const missionId = isString(m.missionId) && m.missionId.length <= 200 ? m.missionId : undefined;
             const runId = isString(m.runId) && m.runId.length <= 200 ? m.runId : undefined;
             const modelStatus = (m.modelStatus === 'continue' || m.modelStatus === 'done') ? m.modelStatus : null;
+            const taskId = isString(m.taskId) && m.taskId.length <= 200 ? m.taskId : undefined;
+            const role = isString(m.role) && m.role.length <= 40 ? m.role : undefined;
+            const summary = isString(m.summary) ? m.summary.slice(0, 8000) : undefined;
             return {
                 ok: true,
                 message: {
@@ -130,7 +143,10 @@ export function validateMessage(raw: unknown): ValidationResult {
                     runAfter: !!m.runAfter,
                     missionId,
                     runId,
-                    modelStatus
+                    modelStatus,
+                    taskId,
+                    role,
+                    summary
                 }
             };
         }
@@ -208,6 +224,62 @@ export function validateMessage(raw: unknown): ValidationResult {
 
         case 'getRun': {
             return { ok: true, message: { type: 'getRun' } };
+        }
+
+        case 'startMultiAgentMission': {
+            if (!isString(m.title) || m.title.trim().length === 0) return fail('startMultiAgentMission: "title" ausente');
+            if (!isString(m.objective) || m.objective.trim().length === 0) return fail('startMultiAgentMission: "objective" ausente');
+            if (m.title.length > 500) return fail('startMultiAgentMission: title grande demais');
+            if (m.objective.length > MAX_QUESTION) return fail('startMultiAgentMission: objective grande demais');
+            return { ok: true, message: { type: 'startMultiAgentMission', title: m.title, objective: m.objective } };
+        }
+
+        case 'dispatchNextTask': {
+            return { ok: true, message: { type: 'dispatchNextTask' } };
+        }
+
+        case 'submitDeliverable': {
+            if (!isString(m.taskId) || m.taskId.length === 0) return fail('submitDeliverable: "taskId" ausente');
+            if (!isString(m.summary)) return fail('submitDeliverable: "summary" ausente');
+            const knownIssues = Array.isArray(m.knownIssues)
+                ? m.knownIssues.filter((x: unknown) => isString(x)).slice(0, 20) as string[]
+                : [];
+            const files = Array.isArray(m.files)
+                ? m.files
+                    .filter((x: unknown) => isString(x) && (x as string).length > 0 && (x as string).length <= 1024)
+                    .slice(0, 200) as string[]
+                : [];
+            return {
+                ok: true,
+                message: {
+                    type: 'submitDeliverable',
+                    taskId: m.taskId,
+                    summary: m.summary.slice(0, 8000),
+                    knownIssues,
+                    buildPassed: !!m.buildPassed,
+                    files
+                }
+            };
+        }
+
+        case 'cancelMultiAgentMission': {
+            const reason = isString(m.reason) ? m.reason.slice(0, 500) : 'cancelado';
+            return { ok: true, message: { type: 'cancelMultiAgentMission', reason } };
+        }
+
+        case 'getMultiAgentState': {
+            return { ok: true, message: { type: 'getMultiAgentState' } };
+        }
+
+        case 'registerSession': {
+            if (!isString(m.sessionId) || m.sessionId.length > 200) return fail('registerSession: "sessionId" inválido');
+            if (!isString(m.provider)) return fail('registerSession: "provider" inválido');
+            return { ok: true, message: { type: 'registerSession', sessionId: m.sessionId, provider: m.provider } };
+        }
+
+        case 'markSessionUnavailable': {
+            if (!isString(m.sessionId) || m.sessionId.length > 200) return fail('markSessionUnavailable: "sessionId" inválido');
+            return { ok: true, message: { type: 'markSessionUnavailable', sessionId: m.sessionId } };
         }
 
         default:

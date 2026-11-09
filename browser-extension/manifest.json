@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Context Sync Bridge (DeepSeek + Gemini)",
-  "version": "1.6",
-  "description": "Conecta o chat web do DeepSeek ou do Gemini ao contexto local do VS Code (sem API).",
+  "name": "Context Sync Bridge (DeepSeek + Gemini + ChatGPT)",
+  "version": "1.8",
+  "description": "Conecta o chat web do DeepSeek, Gemini ou ChatGPT ao contexto local do VS Code (sem API).",
   "permissions": [
     "storage"
   ],
@@ -15,38 +15,58 @@
   ],
   "content_scripts": [
     {
-      "matches": [
-        "https://chat.deepseek.com/*"
-      ],
+      "matches": ["https://chat.deepseek.com/*"],
       "js": [
+        "core/protocol.js",
+        "core/agentState.js",
+        "providers/providerManager.js",
         "providers/deepseek.js",
         "prompt.js",
         "parser.js",
+        "controllers/connectionController.js",
+        "controllers/contextController.js",
+        "controllers/agentController.js",
+        "controllers/sessionManager.js",
+        "controllers/multiagentController.js",
+        "ui/panel.js",
         "content.js"
       ],
       "run_at": "document_idle"
     },
     {
-      "matches": [
-        "https://gemini.google.com/*"
-      ],
+      "matches": ["https://gemini.google.com/*"],
       "js": [
+        "core/protocol.js",
+        "core/agentState.js",
+        "providers/providerManager.js",
         "providers/gemini.js",
         "prompt.js",
         "parser.js",
+        "controllers/connectionController.js",
+        "controllers/contextController.js",
+        "controllers/agentController.js",
+        "controllers/sessionManager.js",
+        "controllers/multiagentController.js",
+        "ui/panel.js",
         "content.js"
       ],
       "run_at": "document_idle"
     },
     {
-      "matches": [
-        "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
-      ],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
       "js": [
+        "core/protocol.js",
+        "core/agentState.js",
+        "providers/providerManager.js",
         "providers/chatgpt.js",
         "prompt.js",
         "parser.js",
+        "controllers/connectionController.js",
+        "controllers/contextController.js",
+        "controllers/agentController.js",
+        "controllers/sessionManager.js",
+        "controllers/multiagentController.js",
+        "ui/panel.js",
         "content.js"
       ],
       "run_at": "document_idle"

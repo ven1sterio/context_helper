@@ -362,9 +362,16 @@ export class TaskRunner implements vscode.Disposable {
             this.channel.appendLine(output);
 
             if (this.abortRequested) {
+                // FIX BUG CRÍTICO: dispose() mata a árvore de processos do terminal.
+                // Só mandar Ctrl+C deixava builds "zumbis" rodando em background,
+                // e o próximo `executeCommand` empilhava em cima de um shell travado.
+                try { term.dispose(); } catch { /* ignore */ }
+                if (this.terminal === term) this.terminal = undefined;
                 return { success: false, exitCode: null, aborted: true, output: output + '\n[Cancelado pelo usuário]' };
             }
             if (timedOut) {
+                try { term.dispose(); } catch { /* ignore */ }
+                if (this.terminal === term) this.terminal = undefined;
                 return { success: false, exitCode: null, output: output + `\n[Tempo esgotado após ${Math.round(timeoutMs / 1000)}s; comando interrompido]` };
             }
             if (exitCode === undefined) return null;

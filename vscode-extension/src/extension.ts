@@ -14,6 +14,14 @@ import { RunManager } from './agent/runManager';
 import { RunHistory } from './agent/runHistory';
 import { RecoveryManager } from './agent/recoveryManager';
 import { ProjectMemory } from './memory/projectMemory';
+import { AgentRegistry } from './multiagent/agentRegistry';
+import { MissionController } from './multiagent/missionController';
+import { DeliverableManager } from './multiagent/deliverableManager';
+import { ReviewManager } from './multiagent/reviewManager';
+import { SessionRouter } from './multiagent/sessionRouter';
+import { TaskDispatcher } from './multiagent/taskDispatcher';
+import { runHealthCheck } from './diagnostics/healthCheck';
+import { showReport } from './diagnostics/diagnosticReport';
 
 const TOKEN_KEY = 'deepseekContextSync.token';
 
@@ -56,11 +64,11 @@ async function activateInternal(context: vscode.ExtensionContext) {
     const indexer = new Indexer(workspaceRoot);
     await indexer.initialize(contextManager);
 
-    // ---------- Fase 5: estado entre conversas ----------
+    // ---------- Estado entre conversas ----------
     const stateManager = new StateManager(workspaceRoot);
     await stateManager.initialize();
 
-    // ---------- Fase 3: memória estruturada ----------
+    // ---------- Memória estruturada ----------
     const projectMemory = new ProjectMemory(workspaceRoot);
     await projectMemory.load();
     stateManager.setMemory(projectMemory);
@@ -102,7 +110,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
     wsServer.setGraphStore(graphStore);
     wsServer.setStateManager(stateManager);
 
-    // ---------- Fase 2: Full Code 2.0 ----------
+    // ---------- Full Code 2.0 ----------
     const planManager = new PlanManager(workspaceRoot);
     const taskQueue = new TaskQueue(planManager);
     const runHistory = new RunHistory(workspaceRoot);
@@ -114,6 +122,26 @@ async function activateInternal(context: vscode.ExtensionContext) {
         queue: taskQueue,
         run: runManager,
         recovery: recoveryManager
+    });
+
+    // ---------- Multiagente ----------
+    const agentRegistry = new AgentRegistry();
+    const deliverables = new DeliverableManager();
+    const reviews = new ReviewManager();
+    const sessions = new SessionRouter();
+    const multiagentMission = new MissionController(
+        agentRegistry, deliverables, reviews, sessions,
+        (e) => console.log('[MultiAgent]', e.kind)
+    );
+    const dispatcher = new TaskDispatcher(agentRegistry, sessions);
+
+    wsServer.setMultiAgentManagers({
+        registry: agentRegistry,
+        mission: multiagentMission,
+        deliverables,
+        reviews,
+        sessions,
+        dispatcher
     });
 
     // Recovery: verifica run interrompida ao ativar
@@ -181,6 +209,22 @@ async function activateInternal(context: vscode.ExtensionContext) {
             vscode.window.showInformationMessage(
                 'Use "DeepSeek Context Sync: Copiar Token" para copiar o token.'
             );
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('deepseekContextSync.diagnose', () => {
+            const report = runHealthCheck({
+                workspaceRoot,
+                hasContextManager: !!contextManager,
+                hasIndexer: !!indexer,
+                hasWsServer: !!wsServer,
+                hasGraph: !!graphStore,
+                hasMemory: !!projectMemory,
+                hasAgent: !!runManager,
+                hasMultiAgent: !!multiagentMission
+            });
+            showReport(report, workspaceRoot);
         })
     );
 

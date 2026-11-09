@@ -19,6 +19,10 @@
       {
         "command": "deepseekContextSync.showToken",
         "title": "DeepSeek Context Sync: Mostrar Token"
+      },
+      {
+        "command": "deepseekContextSync.diagnose",
+        "title": "DeepSeek Context Sync: Diagnóstico"
       }
     ],
     "configuration": {
@@ -119,6 +123,11 @@
           ],
           "default": "auto",
           "description": "Usar o graph.json do graphify para escolher arquivos no modo seletivo."
+        },
+        "deepseekContextSync.useContextBudget": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ordena o contexto completo por prioridade (entry points > configs > README > infra > código > testes) e corta por orçamento de tokens. Desligue para manter a ordem alfabética anterior."
         }
       }
     }
@@ -128,7 +137,7 @@
     "watch": "tsc -watch -p ./",
     "build": "tsc -p ./",
     "test:graph": "npm run compile && node test/graph.smoke.js",
-    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js"
+    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js test/agentRegistry.test.js test/reviewManager.test.js test/finalAuditor.test.js test/missionController.test.js test/integration/fullWorkflow.test.js test/integration/multiagentWorkflow.test.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

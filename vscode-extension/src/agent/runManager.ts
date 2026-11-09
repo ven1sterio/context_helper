@@ -21,6 +21,9 @@ export interface AdvanceResult {
     mission: Mission | null;
 }
 
+/** Tentativas por tarefa antes de marcá-la como blocked. */
+const MAX_ATTEMPTS_PER_TASK = 3;
+
 /**
  * Orquestra uma execução Full Code 2.0.
  *
@@ -85,13 +88,24 @@ export class RunManager {
         this.run.iterations.push(it);
 
         const mission = this.plan.current;
+        if (!mission) throw new Error('Missão não encontrada.');
 
-        // Anota os arquivos aplicados na tarefa atual
-        if (mission && mission.currentTaskId && it.appliedFiles.length > 0) {
+        // Anota arquivos aplicados na tarefa atual
+        if (mission.currentTaskId && it.appliedFiles.length > 0) {
             this.plan.setTaskFiles(mission.currentTaskId, it.appliedFiles);
         }
 
-        const currentTask = mission?.tasks.find(t => t.id === mission.currentTaskId);
+        // FIX BUG 2: se o modelo concluiu E o build passou, marca a task atual
+        // como completed ANTES de evaluate. Sem isso, hasNextTask volta true
+        // (a própria task in_progress) e a missão de 1 tarefa levaria 2 iterações.
+        const buildOk = it.status === 'applied' && it.runSuccess !== false;
+        if (input.modelStatus === 'done' && buildOk && mission.currentTaskId) {
+            this.plan.setTaskStatus(mission.currentTaskId, 'completed');
+        }
+
+        // Guard: usa attempts atual da task (se ela foi pré-completada acima,
+        // currentTaskId é null e o guard só checa falhas/no-progress globais).
+        const currentTask = mission.tasks.find(t => t.id === mission.currentTaskId);
         const guardTrip = this.guard.check(
             this.run.iterations,
             currentTask?.attempts ?? 0,
@@ -108,40 +122,86 @@ export class RunManager {
         };
         const ev = evaluate(evIn);
 
-        // Aplica efeito no plano
-        if (ev.action === 'retry') {
-            if (mission && mission.currentTaskId) {
-                const t = mission.tasks.find(x => x.id === mission.currentTaskId);
-                if (t && t.attempts >= 3) {
-                    this.plan.setTaskStatus(mission.currentTaskId, 'blocked', {
-                        failureReason: it.errors[0] ?? ev.reason
-                    });
+        // Aplica efeito no plano. `action`/`reason` podem ser reescritos no retry
+        // (task bloqueada por excesso de tentativas → avança ou para).
+        let action = ev.action;
+        let reason = ev.reason;
+
+        switch (action) {
+            case 'retry': {
+                if (mission.currentTaskId) {
+                    // FIX BUG 1: incrementa a tentativa via setTaskStatus('in_progress').
+                    // Sem isso, attempts nunca passava de 1 e o limite de retries
+                    // (attempts-per-task no guard e MAX_ATTEMPTS_PER_TASK aqui)
+                    // nunca disparava.
+                    this.plan.setTaskStatus(mission.currentTaskId, 'in_progress');
+                    const t = this.plan.current?.tasks.find(x => x.id === mission.currentTaskId);
+                    if (t && t.attempts >= MAX_ATTEMPTS_PER_TASK) {
+                        this.plan.setTaskStatus(mission.currentTaskId, 'blocked', {
+                            failureReason: it.errors[0] ?? reason
+                        });
+                        const next = this.queue.next();
+                        if (next) {
+                            this.plan.setTaskStatus(next.id, 'in_progress');
+                            action = 'continue';
+                            reason = `Tarefa bloqueada após ${t.attempts} tentativas. Retomando com: ${next.title}`;
+                        } else {
+                            action = 'stop';
+                            reason = `Tarefa bloqueada após ${t.attempts} tentativas. Sem mais tarefas.`;
+                        }
+                    }
+                } else {
+                    const next = this.queue.next();
+                    if (next) {
+                        this.plan.setTaskStatus(next.id, 'in_progress');
+                        action = 'continue';
+                        reason = `Retomando com: ${next.title}`;
+                    } else {
+                        action = 'stop';
+                        reason = 'Sem tarefa ativa para retentar.';
+                    }
                 }
+                break;
             }
-        } else if (ev.action === 'done') {
-            if (mission && mission.currentTaskId) {
-                this.plan.setTaskStatus(mission.currentTaskId, 'completed');
+            case 'done': {
+                // A task normalmente já foi completada no pre-mark acima; este
+                // bloco cobre o caso "modelo concluiu sem arquivos" (no-files+done),
+                // onde o pre-mark não disparou.
+                if (mission.currentTaskId) {
+                    const t = mission.tasks.find(x => x.id === mission.currentTaskId);
+                    if (t && t.status !== 'completed') {
+                        this.plan.setTaskStatus(mission.currentTaskId, 'completed');
+                    }
+                }
+                this.plan.setMissionStatus('completed');
+                break;
             }
-            this.plan.setMissionStatus('completed');
-        } else if (ev.action === 'stop') {
-            if (mission && mission.currentTaskId) {
-                this.plan.setTaskStatus(mission.currentTaskId, 'failed', { failureReason: ev.reason });
+            case 'stop': {
+                if (mission.currentTaskId) {
+                    const t = mission.tasks.find(x => x.id === mission.currentTaskId);
+                    if (t && t.status !== 'completed') {
+                        this.plan.setTaskStatus(mission.currentTaskId, 'failed', { failureReason: reason });
+                    }
+                }
+                this.plan.setMissionStatus('failed');
+                break;
             }
-            this.plan.setMissionStatus('failed');
-        } else if (ev.action === 'continue') {
-            if (input.modelStatus === 'done' && mission && mission.currentTaskId) {
-                this.plan.setTaskStatus(mission.currentTaskId, 'completed');
-                const next = this.queue.next();
-                if (next) this.plan.setTaskStatus(next.id, 'in_progress');
+            case 'continue': {
+                // Se a task atual foi pré-completada, currentTaskId é null —
+                // move para a próxima pendente.
+                if (!mission.currentTaskId) {
+                    const next = this.queue.next();
+                    if (next) this.plan.setTaskStatus(next.id, 'in_progress');
+                }
+                break;
             }
         }
 
-        // Atualiza a run
-        const finished = ev.action === 'done' || ev.action === 'stop';
+        const finished = action === 'done' || action === 'stop';
         if (finished) {
-            this.run.status = ev.action === 'done' ? 'completed' : 'failed';
+            this.run.status = action === 'done' ? 'completed' : 'failed';
             this.run.endedAt = new Date().toISOString();
-            if (ev.action === 'stop') this.run.lastError = ev.reason;
+            if (action === 'stop') this.run.lastError = reason;
             await this.history.save(this.run);
             await this.recovery.saveCurrentRun(null);
         } else {
@@ -150,7 +210,7 @@ export class RunManager {
 
         await this.plan.flush();
 
-        return { action: ev.action, reason: ev.reason, run: this.run, mission: this.plan.current };
+        return { action, reason, run: this.run, mission: this.plan.current };
     }
 
     async cancel(reason: string): Promise<void> {
