@@ -9,6 +9,8 @@
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "https://gemini.google.com/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
     "http://127.0.0.1:8765/*"
   ],
   "content_scripts": [
@@ -30,6 +32,19 @@
       ],
       "js": [
         "providers/gemini.js",
+        "prompt.js",
+        "parser.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "providers/chatgpt.js",
         "prompt.js",
         "parser.js",
         "content.js"

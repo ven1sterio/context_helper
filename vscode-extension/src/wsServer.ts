@@ -23,7 +23,12 @@ export interface WsServerOptions {
     onError?: (err: Error) => void;
 }
 
-const ALLOWED_ORIGINS = ['https://chat.deepseek.com', 'https://gemini.google.com'];
+const ALLOWED_ORIGINS = [
+    'https://chat.deepseek.com',
+    'https://gemini.google.com',
+    'https://chatgpt.com',
+    'https://chat.openai.com'
+];
 
 export class WsServer {
     private wss: WebSocketServer;

@@ -1,6 +1,6 @@
 # DeepSeek Context Sync
 
-Conecta o VS Code ao chat web do **DeepSeek** ou do **Gemini**: envia o contexto do
+Conecta o VS Code ao chat web do **DeepSeek**, **Gemini** ou **ChatGPT**: envia o contexto do
 projeto (completo, só as alterações ou seletivo), recebe de volta `### FILE:` /
 `EDIT:` e aplica no projeto — no modo **manual** (com confirmação) ou em loop
 autônomo (**Full Code**).
@@ -144,6 +144,7 @@ de `...` nem "resto do código"; caminhos só da estrutura enviada.
 - **Gemini:** acima de 40 mil caracteres o contexto vai como anexo `contexto-projeto.txt`
   (o campo de texto leva só as regras, a tree, uma nota e a sua pergunta). Se o anexo falhar,
   o texto é colado em partes.
+- **ChatGPT:** o texto é colado diretamente no editor (`#prompt-textarea`), com fallback para colagem em blocos. Os códigos são lidos pelo parser normalmente.
 
 ### Modo seletivo (🎯)
 
