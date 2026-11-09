@@ -323,7 +323,17 @@ export class WsServer {
 
     dispose() {
         this.configSub?.dispose();
-        this.wss.close();
+        // Encerra à força todas as conexões ANTES de fechar o servidor.
+        // Sem isso, wss.close() fica esperando os clientes (o navegador reconecta
+        // sozinho), o processo do Extension Host demora a sair e a porta 8765
+        // continua presa — o próximo F5 falha ao abrir a porta (EADDRINUSE) e a
+        // janela nova tende a abrir e fechar até o processo antigo morrer.
+        try {
+            for (const client of this.wss.clients) {
+                try { client.terminate(); } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+        try { this.wss.close(); } catch { /* ignore */ }
     }
 }
 

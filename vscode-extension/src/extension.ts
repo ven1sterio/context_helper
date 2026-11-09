@@ -16,6 +16,18 @@ function generateToken(): string {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+    try {
+        await activateInternal(context);
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('[DeepSeek Context Sync] falha na ativação:', e);
+        vscode.window.showErrorMessage(
+            `DeepSeek Context Sync: falha ao ativar — ${maskSecrets(msg)}`
+        );
+    }
+}
+
+async function activateInternal(context: vscode.ExtensionContext) {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceRoot) {
         vscode.window.showErrorMessage('Abra uma pasta de projeto primeiro.');
@@ -52,6 +64,16 @@ export async function activate(context: vscode.ExtensionContext) {
             const msg = err?.message || String(err);
             if (/token inválido/i.test(msg)) return;
             if (/origem recusada/i.test(msg)) return;
+            const code = (err as any)?.code;
+            if (code === 'EADDRINUSE' || /EADDRINUSE|address already in use/i.test(msg)) {
+                vscode.window.showErrorMessage(
+                    'DeepSeek Context Sync: a porta 8765 já está em uso. ' +
+                    'Feche a outra janela do Extension Development Host (ou do VS Code) ' +
+                    'que está com a extensão ativa e pressione F5 de novo. Se persistir, ' +
+                    'encerre processos Node antigos no Gerenciador de Tarefas.'
+                );
+                return;
+            }
             vscode.window.showErrorMessage(
                 `DeepSeek Context Sync: erro no servidor (${maskSecrets(msg)}). ` +
                 'Se a porta 8765 estiver em uso, feche outras janelas de desenvolvimento.'
@@ -124,4 +146,15 @@ export async function activate(context: vscode.ExtensionContext) {
             taskRunner.dispose();
         }
     });
+}
+
+/**
+ * Chamado quando a janela do Extension Development Host (ou do VS Code) fecha.
+ * Os disposables em `context.subscriptions` já fazem a limpeza; exportar
+ * `deactivate` garante que o Extension Host encerre sem deixar a porta 8765
+ * presa — o que fazia o próximo F5 abrir e fechar a janela até o processo
+ * antigo morrer e liberar a porta.
+ */
+export function deactivate() {
+    // No-op intencional: a limpeza real está em context.subscriptions.dispose().
 }
