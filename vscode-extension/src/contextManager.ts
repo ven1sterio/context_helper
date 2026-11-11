@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { EXCLUDED_DIRS, isExcludedPath, isProbablyBinary } from './pathRules';
+import { EXCLUDED_DIRS, isExcludedPath, isProbablyBinary, isInspectableBinary } from './pathRules';
 import { ContextBudget } from './intelligence/contextBudget';
 import { IndexData } from './indexer';
+import { parsePE, formatPEInfo } from './peInspector';
+import { decompileAssembly, isFrameworkAssembly, Limiter } from './decompiler';
 
 export type ChangeKind = 'changed' | 'deleted';
 
@@ -34,6 +36,17 @@ interface TreeNode {
 
 export class ContextManager {
     private files = new Map<string, string>();
+    // Binários (.dll/.exe/...) cujo conteúdo foi resumido em texto pelo
+    // peInspector. Ficam separados de `files` porque não são texto puro —
+    // o resumo é anexado ao contexto em buildFull/buildFullWithBudget/buildDelta.
+    private binaries = new Map<string, string>();
+    // Cache do C# descompilado (ILSpy) por arquivo, validado pelo hash do binário.
+    private decompileCache = new Map<string, { hash: string; block: string }>();
+    // Hash da versão do binário cujo resumo está em `binaries` (descarta resultado atrasado).
+    private binaryHash = new Map<string, string>();
+    private decompileLimiter = new Limiter(2);
+    private decompileCount = 0;
+    private ilspyWarned = false;
     private allPaths = new Set<string>();
     private disposables: vscode.Disposable[] = [];
 
@@ -49,6 +62,12 @@ export class ContextManager {
         return kb * 1024;
     }
 
+    /** Teto de leitura para binários inspecionáveis (.dll/.exe/...). O conteúdo bruto nunca é enviado. */
+    private get maxBinaryBytes(): number {
+        const mb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxBinaryMB', 50);
+        return mb * 1024 * 1024;
+    }
+
     private get maxTotalChars(): number {
         const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 800);
         return kb * 1024;
@@ -60,6 +79,32 @@ export class ContextManager {
 
     getAllFiles(): ReadonlyMap<string, string> {
         return this.files;
+    }
+
+    getBinary(rel: string): string | undefined {
+        return this.binaries.get(rel);
+    }
+
+    getAllBinaries(): ReadonlyMap<string, string> {
+        return this.binaries;
+    }
+
+    private get decompileEnabled(): boolean {
+        return vscode.workspace.getConfiguration('deepseekContextSync').get<boolean>('decompileDotNet', true);
+    }
+
+    private get decompileSettings() {
+        const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
+        return {
+            exePath: cfg.get<string>('ilspyPath', 'ilspycmd') || 'ilspycmd',
+            maxChars: cfg.get<number>('maxDecompiledKB', 200) * 1024,
+            maxAssemblies: cfg.get<number>('maxDecompiledAssemblies', 10),
+            timeoutMs: 120_000,
+        };
+    }
+
+    private get inspectBinariesEnabled(): boolean {
+        return vscode.workspace.getConfiguration('deepseekContextSync').get<boolean>('inspectBinaries', true);
     }
 
     async initialize() {
@@ -92,16 +137,54 @@ export class ContextManager {
 
             this.addPath(rel, notify);
 
-            if (stat.size > this.maxFileBytes) {
+            // DLLs/EXEs costumam passar de 300 KB; antes eram descartados aqui e
+            // nunca chegavam ao inspetor. Binários inspecionáveis têm teto próprio.
+            const inspectable = this.inspectBinariesEnabled && isInspectableBinary(rel);
+            const sizeLimit = inspectable ? this.maxBinaryBytes : this.maxFileBytes;
+            if (stat.size > sizeLimit) {
                 this.removeFile(rel, notify);
+                if (this.binaries.delete(rel) && notify) {
+                    this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+                }
                 return;
             }
 
             const bytes = await vscode.workspace.fs.readFile(uri);
-            if (isProbablyBinary(bytes)) {
+            if (!isProbablyBinary(bytes) && stat.size > this.maxFileBytes) {
+                // Arquivo de texto grande com extensão "inspecionável": segue o limite de texto.
                 this.removeFile(rel, notify);
                 return;
             }
+            if (isProbablyBinary(bytes)) {
+                // Em vez de só descartar, gera um resumo textual do PE
+                // (imports/exports/seções). O chat vê o que é o binário sem
+                // receber bytes crus.
+                this.files.delete(rel);
+                if (this.inspectBinariesEnabled && isInspectableBinary(rel)) {
+                    try {
+                        const info = parsePE(Buffer.from(bytes));
+                        if (info) {
+                            const summary = formatPEInfo(info, rel);
+                            this.binaryHash.set(rel, info.hash);
+                            const cached = this.decompileCache.get(rel);
+                            const useCache = cached && cached.hash === info.hash;
+                            this.binaries.set(rel, useCache ? summary + cached!.block : summary);
+                            if (notify) this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+                            if (info.isManaged && !useCache && this.decompileEnabled && !isFrameworkAssembly(rel)) {
+                                this.scheduleDecompile(rel, uri.fsPath, info.hash, summary);
+                            }
+                            return;
+                        }
+                    } catch { /* parser falhou: cai para o comportamento antigo */ }
+                }
+                if (this.binaries.delete(rel) && notify) {
+                    this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+                }
+                return;
+            }
+
+            // Texto: se antes era binário, limpa o cache de resumo.
+            this.binaries.delete(rel);
 
             const content = Buffer.from(bytes).toString('utf8');
             if (this.files.get(rel) === content) return;
@@ -111,6 +194,41 @@ export class ContextManager {
         } catch {
             // Ignora arquivos inacessíveis
         }
+    }
+
+    /** Decompila em segundo plano com o ILSpy e anexa o C# ao resumo do binário. */
+    private scheduleDecompile(rel: string, fsPath: string, hash: string, summary: string) {
+        const cfg = this.decompileSettings;
+        if (this.decompileCount >= cfg.maxAssemblies) return;
+        this.decompileCount++;
+
+        void this.decompileLimiter.run(async () => {
+            const res = await decompileAssembly(fsPath, {
+                exePath: cfg.exePath,
+                maxChars: cfg.maxChars,
+                timeoutMs: cfg.timeoutMs,
+            });
+
+            if (!res.ok) {
+                if (res.reason === 'not-installed' && !this.ilspyWarned) {
+                    this.ilspyWarned = true;
+                    void vscode.window.showInformationMessage(
+                        'DeepSeek Context Sync: para enviar o código das DLLs .NET é preciso o ILSpy em linha de comando. ' +
+                        'Instale com: dotnet tool install --global ilspycmd (ou ajuste "deepseekContextSync.ilspyPath").'
+                    );
+                }
+                return;
+            }
+
+            // O arquivo pode ter mudado ou sido apagado enquanto decompilava.
+            if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) return;
+
+            const note = res.truncated ? '\n// [código truncado pelo limite "maxDecompiledKB"]' : '';
+            const block = `\n\nCódigo C# descompilado (ILSpy):\n${res.code}${note}`;
+            this.decompileCache.set(rel, { hash, block });
+            this.binaries.set(rel, summary + block);
+            this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+        });
     }
 
     private addPath(rel: string, notify: boolean) {
@@ -133,10 +251,20 @@ export class ContextManager {
         const rel = this.toRel(uri);
         if (!rel) return;
         this.removeFile(rel, true);
+        this.binaries.delete(rel);
+        this.decompileCache.delete(rel);
+        this.binaryHash.delete(rel);
         this.removePath(rel, true);
         const prefix = rel + '/';
         for (const key of [...this.files.keys()]) {
             if (key.startsWith(prefix)) this.removeFile(key, true);
+        }
+        for (const key of [...this.binaries.keys()]) {
+            if (key.startsWith(prefix)) {
+                this.binaries.delete(key);
+                this.decompileCache.delete(key);
+                this.binaryHash.delete(key);
+            }
         }
         for (const key of [...this.allPaths]) {
             if (key.startsWith(prefix)) this.removePath(key, true);
@@ -195,6 +323,19 @@ export class ContextManager {
             files++;
         }
 
+        // Binários resumidos entram depois do código-fonte (mesmo orçamento).
+        for (const rel of [...this.binaries.keys()].sort()) {
+            const summary = this.binaries.get(rel);
+            if (!summary) continue;
+            const block = `\n--- BINÁRIO (PE): ${rel} ---\n${summary}\n`;
+            if (text.length + block.length > max) {
+                omitted.push(rel);
+                continue;
+            }
+            text += block;
+            files++;
+        }
+
         if (omitted.length > 0) {
             text += `\n[Omitidos por limite de tamanho (${omitted.length}): ${omitted.slice(0, 80).join(', ')}]\n`;
             text += `[Aumente "deepseekContextSync.maxTotalKB" nas configurações se precisar enviar mais arquivos.]\n`;
@@ -209,7 +350,9 @@ export class ContextManager {
      */
     buildFullWithBudget(maxTokens: number, index: IndexData): FullResult {
         const budget = new ContextBudget(index);
-        const { ordered, omitted } = budget.compute(maxTokens);
+        const result = budget.compute(maxTokens);
+        const { ordered, omitted } = result;
+        let used = result.totalTokens;
         let text = '';
         let files = 0;
         for (const f of ordered) {
@@ -218,11 +361,29 @@ export class ContextManager {
             text += `\n--- ${f.path} ---\n${content}\n`;
             files++;
         }
-        if (omitted.length > 0) {
-            text += `\n[Omitidos por orçamento (${omitted.length}): ${omitted.slice(0, 80).join(', ')}]\n`;
+
+        // Binários resumidos entram depois do texto, sob o mesmo orçamento.
+        const binOmitted: string[] = [];
+        for (const rel of [...this.binaries.keys()].sort()) {
+            const summary = this.binaries.get(rel);
+            if (!summary) continue;
+            const block = `\n--- BINÁRIO (PE): ${rel} ---\n${summary}\n`;
+            const est = Math.ceil(block.length / 4);
+            if (used + est > maxTokens) {
+                binOmitted.push(rel);
+                continue;
+            }
+            text += block;
+            files++;
+            used += est;
+        }
+
+        const allOmitted = [...omitted, ...binOmitted];
+        if (allOmitted.length > 0) {
+            text += `\n[Omitidos por orçamento (${allOmitted.length}): ${allOmitted.slice(0, 80).join(', ')}]\n`;
             text += `[Aumente "deepseekContextSync.maxContextTokens" ou "maxTotalKB" para incluir mais.]\n`;
         }
-        return { text, files, chars: text.length, omitted };
+        return { text, files, chars: text.length, omitted: allOmitted };
     }
 
     buildDelta(pending: Map<string, ChangeKind>): DeltaResult {
@@ -232,9 +393,17 @@ export class ContextManager {
 
         for (const [rel, kind] of pending) {
             const content = this.files.get(rel);
-            const block = (kind === 'deleted' || content === undefined)
-                ? `\n--- REMOVIDO: ${rel} ---\n`
-                : `\n--- ALTERADO: ${rel} ---\n${content}\n`;
+            const bin = this.binaries.get(rel);
+            let block: string;
+            if (kind === 'deleted' || (content === undefined && bin === undefined)) {
+                block = `\n--- REMOVIDO: ${rel} ---\n`;
+            } else if (content === undefined && bin !== undefined) {
+                block = `\n--- BINÁRIO (PE): ${rel} ---\n${bin}\n`;
+            } else if (content !== undefined) {
+                block = `\n--- ALTERADO: ${rel} ---\n${content}\n`;
+            } else {
+                block = `\n--- REMOVIDO: ${rel} ---\n`;
+            }
 
             if (included.length > 0 && text.length + block.length > max) continue;
 

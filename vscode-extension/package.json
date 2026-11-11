@@ -128,6 +128,36 @@
           "type": "boolean",
           "default": true,
           "description": "Ordena o contexto completo por prioridade (entry points > configs > README > infra > código > testes) e corta por orçamento de tokens. Desligue para manter a ordem alfabética anterior."
+        },
+        "deepseekContextSync.maxBinaryMB": {
+          "type": "number",
+          "default": 50,
+          "description": "Tamanho máximo (MB) de binários (.dll, .exe, ...) que a extensão lê para extrair o resumo textual. Acima disso o arquivo é ignorado. O limite de 'maxFileKB' continua valendo para arquivos de texto."
+        },
+        "deepseekContextSync.decompileDotNet": {
+          "type": "boolean",
+          "default": true,
+          "description": "Decompila DLLs/EXEs .NET com o ILSpy (ilspycmd) e envia o C# no contexto. Requer: dotnet tool install --global ilspycmd. Sem a ferramenta instalada, cai para o resumo de nomes/strings."
+        },
+        "deepseekContextSync.ilspyPath": {
+          "type": "string",
+          "default": "ilspycmd",
+          "description": "Executável do ilspycmd (nome no PATH ou caminho completo)."
+        },
+        "deepseekContextSync.maxDecompiledKB": {
+          "type": "number",
+          "default": 200,
+          "description": "Máximo de KB de C# descompilado por assembly; o excedente é cortado."
+        },
+        "deepseekContextSync.maxDecompiledAssemblies": {
+          "type": "number",
+          "default": 10,
+          "description": "Máximo de assemblies decompilados por sessão (DLLs System.*, Microsoft.* e pastas obj/ são sempre ignoradas)."
+        },
+        "deepseekContextSync.inspectBinaries": {
+          "type": "boolean",
+          "default": true,
+          "description": "Extrai imports/exports/seções, metadados .NET (tipos/métodos/literais) e strings legíveis de binários PE (.dll, .exe, .sys, .ocx, ...) e inclui o resumo em texto no contexto enviado ao chat. NUNCA envia bytes crus. Desligue para ignorar binários por completo. Reabra o workspace para que arquivos já carregados em memória sejam reavaliados."
         }
       }
     }
@@ -137,7 +167,7 @@
     "watch": "tsc -watch -p ./",
     "build": "tsc -p ./",
     "test:graph": "npm run compile && node test/graph.smoke.js",
-    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js test/agentRegistry.test.js test/reviewManager.test.js test/finalAuditor.test.js test/missionController.test.js test/integration/fullWorkflow.test.js test/integration/multiagentWorkflow.test.js"
+    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js test/agentRegistry.test.js test/reviewManager.test.js test/finalAuditor.test.js test/missionController.test.js test/peInspector.test.js test/decompiler.test.js test/integration/fullWorkflow.test.js test/integration/multiagentWorkflow.test.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

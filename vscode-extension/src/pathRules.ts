@@ -159,6 +159,23 @@ export function isProbablyBinary(bytes: Uint8Array): boolean {
 }
 
 /**
+ * Extensões de binário que vale a pena INSPECIONAR (não só descartar).
+ *
+ * O conteúdo bruto continua fora do contexto — o que entra é um resumo
+ * textual extraído por `peInspector.ts` (imports/exports/seções). Isso deixa
+ * o chat raciocinar sobre o binário sem pagar o custo de bytes crus.
+ */
+const INSPECTABLE_BINARY_EXTENSIONS = new Set([
+    '.dll', '.exe', '.sys', '.ocx', '.cpl', '.drv', '.efi', '.scr',
+    '.so', '.dylib', '.node', '.elf', '.dll.a',
+]);
+
+export function isInspectableBinary(rel: string): boolean {
+    const name = rel.split('/').pop() ?? rel;
+    return INSPECTABLE_BINARY_EXTENSIONS.has(path.posix.extname(name).toLowerCase());
+}
+
+/**
  * Mascara padrões com cara de chave/segredo em uma string antes de escrever em
  * log, OutputChannel ou mensagem de erro (Fase 0 do PLANO.md).
  *
