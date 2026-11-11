@@ -158,3 +158,40 @@ test('"EDIT:" pendente não adota um <pre> posterior sem relação', () => {
     const r = loadDom(nodes, 'EDIT: game.js\n' + GAME_BLOCK + '\nDica\n.x { color: red; }');
     assert.ok(!r.files.some(f => f.filePath === 'game.js' && !f.isEdit), 'game.js não pode virar arquivo completo');
 });
+
+test('### FILE: DENTRO do <pre> (ChatGPT com resposta embrulhada) é recuperado', () => {
+    // Reproduz o que o ChatGPT faz às vezes: o marcador E a cerca caem no
+    // mesmo <pre>. Antes do fix, o FILE era silenciosamente ignorado.
+    const inline = '### FILE: src/utils/calculadora.js\n```javascript\nfunction somar(a, b) {\n    return a + b;\n}\n```';
+    const nodes = [pre(inline)];
+    const r = loadDom(nodes, inline);
+    assert.equal(r.problems.length, 0, JSON.stringify(r.problems));
+    const f = r.files.find(x => x.filePath === 'src/utils/calculadora.js');
+    assert.ok(f, JSON.stringify(r.files));
+    assert.ok(!f.isEdit);
+    assert.match(f.content, /function somar/);
+});
+
+test('EDIT: DENTRO do <pre> também é recuperado', () => {
+    const inline = 'EDIT: src/app.js\n```text\n<<<<<<< SEARCH\nconsole.log("antigo");\n=======\nconsole.log("novo");\n>>>>>>> REPLACE\n```';
+    const nodes = [pre(inline)];
+    const r = loadDom(nodes, inline);
+    assert.equal(r.problems.length, 0, JSON.stringify(r.problems));
+    const f = r.files.find(x => x.filePath === 'src/app.js');
+    assert.ok(f && f.isEdit, JSON.stringify(r.files));
+    assert.equal(f.search, 'console.log("antigo");');
+});
+
+test('FILE e EDIT juntos dentro do MESMO <pre>', () => {
+    const inline = [
+        '### FILE: a.js', '```js', 'const a = 1;', '```', '',
+        'EDIT: b.js', '```text',
+        '<<<<<<< SEARCH', 'const b = 2;', '=======', 'const b = 3;', '>>>>>>> REPLACE',
+        '```'
+    ].join('\n');
+    const nodes = [pre(inline)];
+    const r = loadDom(nodes, inline);
+    assert.equal(r.problems.length, 0, JSON.stringify(r.problems));
+    assert.ok(r.files.some(x => x.filePath === 'a.js' && !x.isEdit));
+    assert.ok(r.files.some(x => x.filePath === 'b.js' && x.isEdit));
+});

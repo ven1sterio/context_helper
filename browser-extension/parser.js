@@ -177,6 +177,22 @@ function parseItemsFromContainer(container, warnings) {
     for (const node of container.querySelectorAll('h1,h2,h3,h4,h5,h6,p,pre')) {
         if (node.tagName === 'PRE') {
             const raw = codeTextOf(node);
+
+            // FIX: alguns chats (ChatGPT com respostas longas, Gemini com
+            // markdown strict) às vezes embrulham o próprio "### FILE:" e/ou
+            // "EDIT:" DENTRO da mesma cerca de código — o <pre> então começa
+            // com "### FILE: path\n```lang\n..." em vez de o marcador estar
+            // num <p>/<h*> anterior. Nesse caso o <pre> já contém tudo;
+            // delegamos para o parser por texto, que lida bem com esse layout.
+            if (/^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?(?:FILE|EDIT)[ \t]*:/im.test(raw)) {
+                const inner = parseItemsFromText(raw, warnings);
+                for (const p of inner) results.push(p);
+                pendingFilePath = null;
+                pendingEditPath = null;
+                lastEditPath = null;
+                continue;
+            }
+
             if (pendingFilePath) {
                 results.push({ filePath: pendingFilePath, content: normalizeContent(raw) });
                 pendingFilePath = null;
