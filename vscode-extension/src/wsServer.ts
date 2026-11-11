@@ -350,8 +350,11 @@ export class WsServer {
                             const uniquePaths = new Set<string>();
                             for (const it of m.files) {
                                 if (it && typeof it === 'object') {
-                                    const rel = (it as any).filePath;
-                                    if (typeof rel === 'string') uniquePaths.add(rel);
+                                    const itObj = it as any;
+                                    if (typeof itObj.filePath === 'string') uniquePaths.add(itObj.filePath);
+                                    // MOVE: a ORIGEM tem fingerprint (se foi enviada no
+                                    // contexto); o DESTINO ainda não existe.
+                                    if (typeof itObj.moveFrom === 'string') uniquePaths.add(itObj.moveFrom);
                                 }
                             }
                             const conflicts = this.detectConflicts([...uniquePaths], sentFingerprints);

@@ -32,7 +32,10 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
     private abortRequested = false;
     private registration: vscode.Disposable;
 
-    constructor(private workspaceRoot: string) {
+    constructor(
+        private workspaceRoot: string,
+        private hooks: { findDependents?: (rel: string) => string[]; allFilePaths?: () => ReadonlySet<string> } = {}
+    ) {
         this.registration = vscode.workspace.registerTextDocumentContentProvider(SCHEME, this);
     }
 
@@ -58,7 +61,12 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
         const mode = vscode.workspace.getConfiguration('deepseekContextSync').get<string>('applyMode', 'partial');
         const partial = !options.auto && mode === 'partial';
-        const plan = planFiles(input, this.workspaceRoot, abs => this.readFileSync(abs), { partial, allowUnfenced: !options.auto });
+        const plan = planFiles(input, this.workspaceRoot, abs => this.readFileSync(abs), {
+            partial,
+            allowUnfenced: !options.auto,
+            findDependents: this.hooks.findDependents,
+            allFilePaths: this.hooks.allFilePaths
+        });
         if (!plan.ok) return { status: 'error', message: plan.error };
         const { skipped } = plan;
 
@@ -80,9 +88,21 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
                 return await this.write(entries, skipped, warnings);
             }
 
-            const title = skipped.length > 0
-                ? `Aplicar ${entries.length} arquivo(s)? ${skipped.length} edição(ões) NÃO casaram e serão ignoradas.`
-                : `Aplicar alterações do DeepSeek em ${entries.length} arquivo(s)?`;
+            const deleteCount = entries.filter(e => e.file.delete).length;
+            const moveCount = entries.filter(e => e.file.moveFrom).length;
+            const writeCount = entries.length - deleteCount - moveCount;
+            const parts: string[] = [];
+            if (writeCount > 0) parts.push(`${writeCount} alteração(ões)`);
+            if (deleteCount > 0) parts.push(`🗑️ excluir ${deleteCount}`);
+            if (moveCount > 0) parts.push(`📦 mover ${moveCount}`);
+            let title: string;
+            if (moveCount > 0 || deleteCount > 0) {
+                title = `Aplicar: ${parts.join(' + ')}?`;
+            } else {
+                title = skipped.length > 0
+                    ? `Aplicar ${entries.length} arquivo(s)? ${skipped.length} edição(ões) NÃO casaram e serão ignoradas.`
+                    : `Aplicar alterações do DeepSeek em ${entries.length} arquivo(s)?`;
+            }
             let choice: string | undefined = await vscode.window.showWarningMessage(
                 title,
                 { modal: true, detail: this.describe(entries, skipped, warnings) },
@@ -144,6 +164,17 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
     private describe(entries: Entry[], skipped: string[] = [], warnings: string[] = []): string {
         const files = entries.map(e => {
+            if (e.file.delete) {
+                return `• 🗑️ ${e.file.rel} — DELETAR${e.doc ? ` (${e.oldLines} linhas)` : ''}`;
+            }
+            if (e.file.moveFrom) {
+                return `• 📦 ${e.file.moveFrom.rel} → ${e.file.rel} — MOVER`;
+            }
+            if (e.file.replaceLines) {
+                const r = e.file.replaceLines;
+                const rangeLabel = r.start === r.end ? `linha ${r.start}` : `linhas ${r.start}-${r.end}`;
+                return `• ✂️ ${e.file.rel} — REPLACE_LINES ${rangeLabel} (${e.oldLines} → ${e.newLines} linhas)`;
+            }
             if (!e.doc) return `• ${e.file.rel} — NOVO (${e.newLines} linhas)`;
             let line = `• ${e.file.rel} — ${e.oldLines} → ${e.newLines} linhas`;
             const name = e.file.rel.split('/').pop() ?? '';
@@ -165,7 +196,14 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
     }
 
     private async backup(entries: Entry[]): Promise<void> {
-        const existing = entries.filter(e => e.doc);
+        // Backup de qualquer arquivo que será sobrescrito, excluído ou MOVIDO.
+        // Para MOVE, a origem é quem precisa ser salva (o destino não existe).
+        const existing = entries.filter(e => {
+            const pathToSave = e.file.moveFrom ? e.file.moveFrom.abs : e.file.abs;
+            if (e.doc) return true;
+            if (!e.file.delete && !e.file.moveFrom) return false;
+            try { return fs.existsSync(pathToSave); } catch { return false; }
+        });
         if (existing.length === 0) return;
 
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -175,9 +213,20 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
         for (const e of existing) {
             try {
+                if (e.file.moveFrom) {
+                    // Backup da origem (nome = caminho original).
+                    const target = path.join(dir, e.file.moveFrom.rel.split('/').join(path.sep));
+                    await fs.promises.mkdir(path.dirname(target), { recursive: true });
+                    await fs.promises.copyFile(e.file.moveFrom.abs, target);
+                    continue;
+                }
                 const target = path.join(dir, e.file.rel.split('/').join(path.sep));
                 await fs.promises.mkdir(path.dirname(target), { recursive: true });
-                await fs.promises.writeFile(target, e.doc!.getText(), 'utf8');
+                if (e.doc) {
+                    await fs.promises.writeFile(target, e.doc.getText(), 'utf8');
+                } else {
+                    await fs.promises.copyFile(e.file.abs, target);
+                }
             } catch { /* ignore */ }
         }
 
@@ -195,6 +244,7 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
 
     private async openDiffs(entries: Entry[]) {
         for (const e of entries) {
+            if (e.file.delete || e.file.moveFrom) continue;
             const right = vscode.Uri.from({ scheme: SCHEME, path: '/proposed/' + e.file.rel });
             const left = e.doc ? e.uri : vscode.Uri.from({ scheme: SCHEME, path: '/empty' });
             this.proposals.set(right.path, e.file.content);
@@ -233,13 +283,33 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         const verifyFn = async (abs: string, expected: string) => {
             try {
                 const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(abs));
-                return Buffer.from(bytes).toString('utf8') === expected;
+                const actual = Buffer.from(bytes).toString('utf8');
+                // Comparação tolerante: normaliza EOL (CRLF vs LF) e remove trailing whitespace.
+                // Isso evita que o auto-formatador do VS Code quebre a aplicação por diferenças
+                // invisíveis de espaços no fim das linhas.
+                const normalize = (s: string) => s.replace(/\r\n/g, '\n').trimEnd();
+                return normalize(actual) === normalize(expected);
             } catch {
                 return false;
             }
         };
 
-        const tx = new ApplyTransaction(this.workspaceRoot, writeFn, verifyFn);
+        // Passa pelo FileSystem do VS Code em vez de fs.unlink direto — assim
+        // respeita a abstração (remote workspaces, virtual FS) e falha de forma
+        // consistente quando o arquivo está aberto e dirty.
+        const deleteFn = async (abs: string) => {
+            await vscode.workspace.fs.delete(vscode.Uri.file(abs), { useTrash: false, recursive: false });
+        };
+
+        const moveFn = async (fromAbs: string, toAbs: string) => {
+            await vscode.workspace.fs.rename(
+                vscode.Uri.file(fromAbs),
+                vscode.Uri.file(toAbs),
+                { overwrite: false }
+            );
+        };
+
+        const tx = new ApplyTransaction(this.workspaceRoot, writeFn, verifyFn, deleteFn, moveFn);
         const result = await tx.run(entries.map(e => e.file));
         if (!result.ok) {
             return {
@@ -252,10 +322,28 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         }
 
         const names = result.applied;
+        const deletedSet = new Set(entries.filter(e => e.file.delete).map(e => e.file.rel));
+        const deleted = names.filter(n => deletedSet.has(n));
+        const moveMap = new Map<string, string>(); // destRel → fromRel
+        for (const e of entries) {
+            if (e.file.moveFrom) moveMap.set(e.file.rel, e.file.moveFrom.rel);
+        }
+        const moved: Array<{ from: string; to: string }> = [];
+        for (const n of names) {
+            const fromRel = moveMap.get(n);
+            if (fromRel) moved.push({ from: fromRel, to: n });
+        }
+        const updatedCount = names.length - deleted.length - moved.length;
+        const summaryParts: string[] = [];
+        if (updatedCount > 0) summaryParts.push(`${updatedCount} atualizado(s)`);
+        if (deleted.length > 0) summaryParts.push(`🗑️ ${deleted.length} excluído(s)`);
+        if (moved.length > 0) summaryParts.push(`📦 ${moved.length} movido(s)`);
+        const summary = summaryParts.join(', ') || 'nada alterado';
+
         const shown = names.length <= 3
             ? names.join(', ')
             : `${names.slice(0, 3).join(', ')} e mais ${names.length - 3}`;
-        vscode.window.showInformationMessage(`✅ DeepSeek: ${names.length} arquivo(s) atualizado(s): ${shown}`);
+        vscode.window.showInformationMessage(`✅ DeepSeek: ${summary}: ${shown}`);
         if (skipped.length) {
             vscode.window.showWarningMessage(`DeepSeek: ${skipped.length} edição(ões) ignorada(s):\n${skipped.join('\n')}`);
         }
@@ -265,8 +353,10 @@ export class ApplyManager implements vscode.TextDocumentContentProvider, vscode.
         const tail = skipped.length ? ` ⚠️ ${skipped.length} edição(ões) ignorada(s): ${skipped.join(' | ')}` : '';
         return {
             status: 'applied',
-            message: `${names.length} arquivo(s) atualizado(s).${tail}`,
+            message: `${summary}.${tail}`,
             files: names,
+            deleted: deleted.length > 0 ? deleted : undefined,
+            moved: moved.length > 0 ? moved : undefined,
             skipped,
             warnings
         };

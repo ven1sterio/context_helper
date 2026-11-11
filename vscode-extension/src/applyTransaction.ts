@@ -6,6 +6,8 @@ export interface TransactionBackup {
     rel: string;
     abs: string;
     content: string | null; // null = arquivo não existia (vai ser criado)
+    /** Preenchido quando a operação é MOVE — para reverter com rename de volta. */
+    moveFrom?: { rel: string; abs: string };
 }
 
 export interface TransactionResult {
@@ -32,7 +34,11 @@ export class ApplyTransaction {
     constructor(
         private workspaceRoot: string,
         private writeFile: (abs: string, content: string) => Promise<void>,
-        private verifyFile: (abs: string, expectedContent: string) => Promise<boolean> = async () => true
+        private verifyFile: (abs: string, expectedContent: string) => Promise<boolean> = async () => true,
+        private deleteFile: (abs: string) => Promise<void> = async (abs) => { await fs.promises.unlink(abs); },
+        private moveFile: (fromAbs: string, toAbs: string) => Promise<void> = async (fromAbs, toAbs) => {
+            await fs.promises.rename(fromAbs, toAbs);
+        }
     ) {}
 
     async run(files: PlannedFile[]): Promise<TransactionResult> {
@@ -41,6 +47,11 @@ export class ApplyTransaction {
         // 1) snapshot em memória
         const backups: TransactionBackup[] = [];
         for (const f of files) {
+            if (f.moveFrom) {
+                // MOVE: guardamos a origem para rollback via rename de volta.
+                backups.push({ rel: f.rel, abs: f.abs, content: null, moveFrom: f.moveFrom });
+                continue;
+            }
             let content: string | null = null;
             try {
                 if (fs.existsSync(f.abs)) content = fs.readFileSync(f.abs, 'utf8');
@@ -54,6 +65,18 @@ export class ApplyTransaction {
         const applied: string[] = [];
         try {
             for (const f of files) {
+                if (f.delete) {
+                    await this.deleteFile(f.abs);
+                    applied.push(f.rel);
+                    continue;
+                }
+                if (f.moveFrom) {
+                    if (fs.existsSync(f.abs)) throw new Error(`destino já existe: ${f.rel}`);
+                    try { await fs.promises.mkdir(path.dirname(f.abs), { recursive: true }); } catch { /* ignore */ }
+                    await this.moveFile(f.moveFrom.abs, f.abs);
+                    applied.push(f.rel);
+                    continue;
+                }
                 try {
                     await fs.promises.mkdir(path.dirname(f.abs), { recursive: true });
                 } catch { /* diretório já existe */ }
@@ -79,7 +102,14 @@ export class ApplyTransaction {
         const restored: string[] = [];
         for (const b of backups) {
             try {
-                if (b.content === null) {
+                if (b.moveFrom) {
+                    // Desfaz o move SÓ se ele realmente aconteceu.
+                    // Se a origem ainda existe, o move falhou logo antes e o
+                    // destino existente é o original — não podemos sobrescrevê-lo!
+                    if (!fs.existsSync(b.moveFrom.abs) && fs.existsSync(b.abs)) {
+                        await this.moveFile(b.abs, b.moveFrom.abs);
+                    }
+                } else if (b.content === null) {
                     if (fs.existsSync(b.abs)) await fs.promises.unlink(b.abs);
                 } else {
                     await this.writeFile(b.abs, b.content);

@@ -76,6 +76,37 @@ function validateApplyItem(item: unknown): { ok: true; value: unknown } | { ok: 
     if (!isString(it.filePath) || it.filePath.length === 0 || it.filePath.length > MAX_FILEPATH_CHARS) {
         return { ok: false, error: 'filePath inválido' };
     }
+    if (it.delete === true) {
+        // DELETE — só o caminho. Corpo é ignorado.
+        return { ok: true, value: { filePath: it.filePath, delete: true } };
+    }
+    if (isString(it.moveFrom) && it.moveFrom.length > 0) {
+        // MOVE — filePath é o destino, moveFrom é a origem.
+        if (it.moveFrom.length > MAX_FILEPATH_CHARS) {
+            return { ok: false, error: `moveFrom grande demais em ${it.filePath}` };
+        }
+        return { ok: true, value: { filePath: it.filePath, moveFrom: it.moveFrom } };
+    }
+    if (it.replaceLines !== undefined && it.replaceLines !== null) {
+        // REPLACE_LINES — precisa de range { start, end } e conteúdo.
+        if (typeof it.replaceLines !== 'object') {
+            return { ok: false, error: `replaceLines inválido em ${it.filePath}` };
+        }
+        const rl = it.replaceLines as Record<string, unknown>;
+        const start = Number(rl.start);
+        const end = Number(rl.end);
+        if (!Number.isInteger(start) || !Number.isInteger(end)) {
+            return { ok: false, error: `replaceLines.start/end não são inteiros em ${it.filePath}` };
+        }
+        if (start < 1 || end < start || end > 10_000_000) {
+            return { ok: false, error: `replaceLines fora do permitido em ${it.filePath}` };
+        }
+        if (!isString(it.content)) return { ok: false, error: `conteúdo ausente em ${it.filePath}` };
+        if (it.content.length > MAX_ITEM_CHARS) {
+            return { ok: false, error: `conteúdo grande demais em ${it.filePath}` };
+        }
+        return { ok: true, value: { filePath: it.filePath, replaceLines: { start, end }, content: it.content } };
+    }
     if (it.isEdit) {
         if (!isString(it.search)) return { ok: false, error: `SEARCH ausente em ${it.filePath}` };
         if (!isString(it.replace)) return { ok: false, error: `REPLACE ausente em ${it.filePath}` };

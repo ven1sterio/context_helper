@@ -1,11 +1,17 @@
 import * as path from 'path';
 import { isExcludedPathForWrite } from './pathRules';
 import { validatePath } from './security/pathValidator';
+import { rewriteImportSpecs } from './importRewriter';
 
 export interface ApplyResult {
     status: 'applied' | 'cancelled' | 'error';
     message: string;
+    /** Todos os caminhos efetivamente alterados (escritos + excluídos + destino de moves). */
     files?: string[];
+    /** Subconjunto de `files` que foram excluídos do disco. */
+    deleted?: string[];
+    /** Moves realizados (origem → destino). */
+    moved?: Array<{ from: string; to: string }>;
     /** Edições que não casaram e foram ignoradas (modo parcial). */
     skipped?: string[];
     /** Avisos (correspondência tolerante, edição já aplicada...). */
@@ -16,6 +22,12 @@ export interface PlannedFile {
     rel: string;
     abs: string;
     content: string;
+    /** DELETE: o arquivo deve ser removido do disco (content é ignorado). */
+    delete?: boolean;
+    /** MOVE/RENAME: origem do move. `rel`/`abs` são o DESTINO. */
+    moveFrom?: { rel: string; abs: string };
+    /** REPLACE_LINES: range 1-indexado inclusivo usado para montar `content`. */
+    replaceLines?: { start: number; end: number };
 }
 
 export type PlanOutcome =
@@ -34,6 +46,16 @@ export interface PlanOptions {
      * automático (sem revisão humana) deve passar false.
      */
     allowUnfenced?: boolean;
+    /**
+     * Callback opcional: quem importa o arquivo `rel` (mesma semântica de
+     * `Indexer.getDependentsOf`). Necessário só para MOVE reescrever imports.
+     */
+    findDependents?: (rel: string) => string[];
+    /**
+     * Callback opcional: conjunto atual de caminhos relativos do projeto.
+     * Necessário só para resolver os imports dos dependentes.
+     */
+    allFilePaths?: () => ReadonlySet<string>;
 }
 
 export const MAX_APPLY_FILES = 20;
@@ -48,6 +70,9 @@ interface RawItem {
     search?: unknown;
     replace?: unknown;
     unfenced?: unknown;
+    delete?: unknown;
+    moveFrom?: unknown;
+    replaceLines?: unknown;
 }
 
 function normalizeEol(text: string): string {
@@ -262,18 +287,7 @@ interface EditState {
 
 /**
  * Valida o que veio do navegador e resolve cada operação em um arquivo final.
- *
- * Aceita dois tipos de item (o navegador envia tudo em `files`):
- *  - `{ filePath, content }` — arquivo completo (criar ou substituir).
- *  - `{ filePath, isEdit: true, search, replace }` — edição pontual.
- *
- * Várias edições no mesmo arquivo são aplicadas em ordem. Por padrão a aplicação
- * é atômica; com `options.partial` as edições que não casam são puladas e listadas
- * em `skipped` (o que casou é aplicado). Edições cujo REPLACE já está no arquivo
- * são tratadas como "já aplicadas" (aviso, não erro).
- *
- * EOL: o original é normalizado para LF para comparar/aplicar e, se tinha CRLF,
- * o resultado volta para CRLF.
+ * ...
  */
 export function planFiles(
     input: unknown,
@@ -291,6 +305,22 @@ export function planFiles(
     const skipped: string[] = [];
     const warnings: string[] = [];
 
+    // Helper: verifica se o caminho já está ocupado por outra operação no mesmo lote.
+    const isBusy = (target: string): string | null => {
+        if (byRel.has(target)) {
+            const prior = byRel.get(target)!;
+            if (prior.delete) return 'DELETE';
+            if (prior.moveFrom) return 'MOVE';
+            if (prior.replaceLines) return 'REPLACE_LINES';
+            return 'FILE';
+        }
+        if (editState.has(target)) return 'EDIT';
+        for (const f of byRel.values()) {
+            if (f.moveFrom?.rel === target) return 'MOVE (origem)';
+        }
+        return null;
+    };
+
     for (const raw of input) {
         if (!raw || typeof raw !== 'object') return fail('Formato de operação inválido.');
         const item = raw as RawItem;
@@ -303,6 +333,124 @@ export function planFiles(
         const { rel, abs } = validated;
         if (isExcludedPathForWrite(rel)) return fail(`Caminho protegido (não pode ser alterado pelo chat): ${rel}`);
 
+        if (item.delete === true) {
+            const prior = isBusy(rel);
+            if (prior) {
+                return fail(`Conflito: ${rel} aparece como ${prior} e DELETE na mesma resposta (use só um).`);
+            }
+            const original = readFile(abs);
+            if (original === undefined) {
+                const msg = `DELETE ${rel}: o arquivo não existe no disco (nada a excluir).`;
+                if (partial) { skipped.push(msg); continue; }
+                return fail(msg);
+            }
+            byRel.set(rel, { rel, abs, content: '', delete: true });
+            continue;
+        }
+
+        if (item.replaceLines !== undefined && item.replaceLines !== null) {
+            const rl = item.replaceLines as Record<string, unknown>;
+            const start = Number(rl?.start);
+            const end = Number(rl?.end);
+            if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+                return fail(`REPLACE_LINES ${rel}: range inválido (${String(rl?.start)}-${String(rl?.end)}).`);
+            }
+            if (typeof item.content !== 'string') {
+                return fail(`REPLACE_LINES ${rel}: conteúdo ausente.`);
+            }
+            if (item.content.length > MAX_APPLY_FILE_CHARS) {
+                return fail(`REPLACE_LINES ${rel}: conteúdo grande demais.`);
+            }
+
+            const prior = isBusy(rel);
+            if (prior) {
+                return fail(`Conflito: ${rel} aparece como ${prior} e REPLACE_LINES na mesma resposta (use só um).`);
+            }
+
+            const original = readFile(abs);
+            if (original === undefined) {
+                const msg = `REPLACE_LINES ${rel}: o arquivo não existe no disco.`;
+                if (partial) { skipped.push(msg); continue; }
+                return fail(msg);
+            }
+
+            const hadCRLF = original.includes('\r\n');
+            const lf = hadCRLF ? original.replace(/\r\n/g, '\n') : original;
+            let originalLines: string[];
+            if (lf === '') {
+                originalLines = [];
+            } else {
+                originalLines = lf.split('\n');
+                if (originalLines[originalLines.length - 1] === '') originalLines.pop();
+            }
+
+            if (end > originalLines.length) {
+                const msg = `REPLACE_LINES ${rel}: a linha final ${end} excede o arquivo (${originalLines.length} linha(s)).`;
+                if (partial) { skipped.push(msg); continue; }
+                return fail(msg);
+            }
+
+            let newLines = item.content.split('\n');
+            if (newLines.length > 0 && newLines[newLines.length - 1] === '') newLines.pop();
+
+            const merged = [
+                ...originalLines.slice(0, start - 1),
+                ...newLines,
+                ...originalLines.slice(end)
+            ];
+            let finalContent = merged.join('\n');
+            if (lf !== '' && lf.endsWith('\n')) finalContent += '\n';
+            if (hadCRLF) finalContent = finalContent.replace(/\n/g, '\r\n');
+
+            byRel.set(rel, {
+                rel,
+                abs,
+                content: finalContent,
+                replaceLines: { start, end }
+            });
+            continue;
+        }
+
+        if (typeof item.moveFrom === 'string' && item.moveFrom.trim()) {
+            const validatedFrom = validatePath(item.moveFrom, root);
+            if (!validatedFrom.ok) return fail(validatedFrom.error);
+            const fromRel = validatedFrom.rel;
+            const fromAbs = validatedFrom.abs;
+
+            if (isExcludedPathForWrite(fromRel)) return fail(`Caminho protegido: ${fromRel}`);
+            if (fromRel === rel) {
+                return fail(`MOVE ${fromRel} -> ${rel}: origem e destino são iguais.`);
+            }
+
+            const busyTo = isBusy(rel);
+            if (busyTo) {
+                return fail(`Conflito: ${rel} aparece como destino de MOVE e também como ${busyTo}.`);
+            }
+            const busyFrom = isBusy(fromRel);
+            if (busyFrom) {
+                return fail(`Conflito: ${fromRel} aparece como origem de MOVE e também como ${busyFrom}.`);
+            }
+
+            if (readFile(fromAbs) === undefined) {
+                const msg = `MOVE ${fromRel} -> ${rel}: a origem não existe no disco.`;
+                if (partial) { skipped.push(msg); continue; }
+                return fail(msg);
+            }
+            if (readFile(abs) !== undefined) {
+                const msg = `MOVE ${fromRel} -> ${rel}: o destino já existe. Escolha outro caminho ou use EDIT/### FILE: para sobrescrever.`;
+                if (partial) { skipped.push(msg); continue; }
+                return fail(msg);
+            }
+
+            byRel.set(rel, {
+                rel,
+                abs,
+                content: '',
+                moveFrom: { rel: fromRel, abs: fromAbs }
+            });
+            continue;
+        }
+
         if (item.isEdit) {
             if (typeof item.search !== 'string' || typeof item.replace !== 'string') {
                 return fail(`EDIT ${rel}: SEARCH/REPLACE ausente.`);
@@ -310,8 +458,10 @@ export function planFiles(
             if (item.search.trim() === '') return fail(`EDIT ${rel}: SEARCH vazio.`);
             if (item.search.length > MAX_APPLY_FILE_CHARS) return fail(`EDIT ${rel}: SEARCH grande demais.`);
             if (item.replace.length > MAX_APPLY_FILE_CHARS) return fail(`EDIT ${rel}: REPLACE grande demais.`);
-            if (byRel.has(rel)) {
-                return fail(`Conflito: ${rel} aparece como FILE: e EDIT: na mesma resposta.`);
+
+            const prior = isBusy(rel);
+            if (prior && prior !== 'EDIT') {
+                return fail(`Conflito: ${rel} aparece como ${prior} e EDIT na mesma resposta (use só um).`);
             }
 
             let state = editState.get(rel);
@@ -347,7 +497,6 @@ export function planFiles(
                 continue;
             }
 
-            // Edição que já foi aplicada antes (REPLACE já presente no arquivo).
             const rep = normalizeEol(item.replace);
             if (res.reason === 'none' && rep.trim().length >= 6 && countOccurrences(state.content, rep) >= 1) {
                 warnings.push(`${label}: já parece aplicada (o REPLACE já está no arquivo); ignorada.`);
@@ -365,8 +514,10 @@ export function planFiles(
             if (item.content.length > MAX_APPLY_FILE_CHARS) {
                 return fail(`${rel}: arquivo grande demais (máximo ${MAX_APPLY_FILE_CHARS} caracteres).`);
             }
-            if (editState.has(rel)) {
-                return fail(`Conflito: ${rel} aparece como FILE: e EDIT: na mesma resposta.`);
+
+            const prior = isBusy(rel);
+            if (prior && prior !== 'FILE') {
+                return fail(`Conflito: ${rel} aparece como ${prior} e FILE na mesma resposta (use só um).`);
             }
             byRel.set(rel, { rel, abs, content: item.content });
         }
@@ -379,11 +530,36 @@ export function planFiles(
         byRel.set(rel, { rel, abs: s.abs, content: finalContent });
     }
 
+    // Reescrita de imports dos dependentes, se o caller informou os callbacks.
+    // (Só roda quando há pelo menos um MOVE — não afeta writes/deletes/edits.)
+    const moves = [...byRel.values()].filter(f => !!f.moveFrom);
+    if (moves.length > 0 && options.findDependents && options.allFilePaths) {
+        const allPaths = options.allFilePaths();
+        for (const mv of moves) {
+            const fromRel = mv.moveFrom!.rel;
+            const dependents = options.findDependents(fromRel) ?? [];
+            for (const dep of dependents) {
+                if (byRel.has(dep) || editState.has(dep)) {
+                    warnings.push(`MOVE ${fromRel} -> ${mv.rel}: ${dep} já estava no lote; import não foi reescrito automaticamente.`);
+                    continue;
+                }
+                const currentContent = readFile(path.join(root, dep.split('/').join(path.sep)));
+                if (currentContent === undefined) continue;
+                const rewritten = rewriteImportSpecs(currentContent, dep, fromRel, mv.rel, allPaths);
+                if (!rewritten) continue;
+                const depAbs = path.join(root, dep.split('/').join(path.sep));
+                byRel.set(dep, { rel: dep, abs: depAbs, content: rewritten.content });
+                warnings.push(`MOVE ${fromRel} -> ${mv.rel}: ${rewritten.changes} import(s) reescrito(s) em ${dep}.`);
+            }
+        }
+    }
+
     if (byRel.size === 0) {
         const why = [...skipped, ...warnings];
         return fail('Nada a aplicar.' + (why.length ? '\n' + why.map(w => `• ${w}`).join('\n') : ''));
     }
-    if (byRel.size > MAX_APPLY_FILES) return fail(`Arquivos demais (máximo ${MAX_APPLY_FILES}).`);
+    const limit = moves.length > 0 ? MAX_APPLY_FILES * 2 : MAX_APPLY_FILES;
+    if (byRel.size > limit) return fail(`Arquivos demais (máximo ${limit}).`);
 
     return { ok: true, files: [...byRel.values()], skipped, warnings };
 }

@@ -73,7 +73,10 @@ async function activateInternal(context: vscode.ExtensionContext) {
     await projectMemory.load();
     stateManager.setMemory(projectMemory);
 
-    const applyManager = new ApplyManager(workspaceRoot);
+    const applyManager = new ApplyManager(workspaceRoot, {
+        findDependents: (rel) => indexer.getDependentsOf(rel),
+        allFilePaths: () => new Set(Object.keys(indexer.getIndex().files))
+    });
     const taskRunner = new TaskRunner(workspaceRoot);
 
     const wsServer = new WsServer(contextManager, {
