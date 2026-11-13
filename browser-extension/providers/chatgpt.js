@@ -6,9 +6,14 @@
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+    // Do mais específico para o mais genérico (o ChatGPT muda o DOM com frequência).
     const ASSISTANT_SELECTORS = [
         '[data-message-author-role="assistant"] .markdown',
-        '[data-message-author-role="assistant"]'
+        '[data-message-author-role="assistant"]',
+        'article[data-testid^="conversation-turn"] .markdown',
+        '[data-testid^="conversation-turn"] .markdown',
+        'div.markdown.prose',
+        '.markdown'
     ];
 
     const INPUT_SELECTORS = [
@@ -150,8 +155,14 @@
                 await sleep(40);
             }
             const expected = text.replace(/\s+/g, '').length;
-            const got = (input.textContent || input.value || '').replace(/\s+/g, '').length;
-            return got >= expected * 0.9;
+            const readGot = () => (input.textContent || input.value || '').replace(/\s+/g, '').length;
+            // O editor processa o paste de forma assíncrona: conferir logo após o último
+            // pedaço dava falso "só parte do texto". Espera até ~3s antes de concluir.
+            for (let i = 0; i < 20; i++) {
+                if (readGot() >= expected * 0.9) return true;
+                await sleep(150);
+            }
+            return false;
         }
 
         /** Há um chip/preview de anexo mostrando esse nome de arquivo? */
