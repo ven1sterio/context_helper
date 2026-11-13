@@ -14,6 +14,16 @@ export interface ChangeEvent {
     kind: ChangeKind;
 }
 
+/** Falha de decompilação que merece sair do console e chegar ao usuário. */
+export interface DecompileFailure {
+    rel: string;
+    kind: 'dotnet' | 'ghidra';
+    /** Primeira linha do erro, para dedup/telemetria. */
+    reason: string;
+    /** Texto completo do erro (vai para o OutputChannel). */
+    detail: string;
+}
+
 export interface FullResult {
     text: string;
     files: number;
@@ -54,8 +64,10 @@ export class ContextManager {
 
     private readonly _onDidChange = new vscode.EventEmitter<ChangeEvent>();
     private readonly _onDidChangeTree = new vscode.EventEmitter<void>();
+    private readonly _onDecompileFailure = new vscode.EventEmitter<DecompileFailure>();
     readonly onDidChange = this._onDidChange.event;
     readonly onDidChangeTree = this._onDidChangeTree.event;
+    readonly onDecompileFailure = this._onDecompileFailure.event;
 
     constructor(private workspaceRoot: string) {}
 
@@ -94,11 +106,26 @@ export class ContextManager {
         this.reCacheDir = dir;
     }
 
-    async awaitDecompiles(timeoutMs = 45000): Promise<void> {
+    /**
+     * Espera as decompilações terminarem por até `timeoutMs`.
+     * Devolve `{ timedOut, stillPending }` — quem chamou decide se avisa o
+     * usuário que o contexto foi enviado sem essas DLLs.
+     */
+    async awaitDecompiles(timeoutMs = 45000): Promise<{ timedOut: boolean; stillPending: string[] }> {
         const start = Date.now();
         while (this.pendingDecompiles.size > 0 && Date.now() - start < timeoutMs) {
             await new Promise<void>(r => setTimeout(r, 500));
         }
+        return {
+            timedOut: this.pendingDecompiles.size > 0,
+            stillPending: [...this.pendingDecompiles]
+        };
+    }
+
+    private fireDecompileFailure(rel: string, kind: 'dotnet' | 'ghidra', detail: string): void {
+        const clean = String(detail || 'erro desconhecido').trim();
+        const reason = clean.split('\n')[0].replace(/^ERRO:\s*/i, '').slice(0, 300);
+        try { this._onDecompileFailure.fire({ rel, kind, reason, detail: clean }); } catch { /* ignore */ }
     }
 
     /** Snapshot do progresso atual — usado pela status bar e pelo WS. */
@@ -280,10 +307,12 @@ export class ContextManager {
                             'Instale com: dotnet tool install --global ilspycmd (ou ajuste "deepseekContextSync.ilspyPath").'
                         );
                     }
+                    const detail = 'ILSpy falhou (' + res.reason + ')' + (res.detail ? ': ' + res.detail : '');
                     this.setDecompileJob(rel, 'failed', {
                         endedAt: new Date().toISOString(),
-                        error: res.reason + (res.detail ? ': ' + res.detail : '')
+                        error: detail
                     });
+                    this.fireDecompileFailure(rel, 'dotnet', detail);
                     return;
                 }
 
@@ -385,6 +414,7 @@ export class ContextManager {
                         endedAt: new Date().toISOString(),
                         error: res.text.slice(0, 500)
                     });
+                    this.fireDecompileFailure(rel, 'ghidra', res.text);
                     return;
                 }
 
@@ -393,6 +423,8 @@ export class ContextManager {
                         endedAt: new Date().toISOString(),
                         error: 'arquivo mudou durante a decompilação'
                     });
+                    this.fireDecompileFailure(rel, 'ghidra',
+                        'arquivo mudou ou sumiu durante a decompilação; resultado descartado para não sobrescrever o contexto com código desatualizado');
                     return;
                 }
 
@@ -403,10 +435,12 @@ export class ContextManager {
                 this._onDidChange.fire({ relPath: rel, kind: 'changed' });
             } catch (e) {
                 console.warn('[DeepSeek Context Sync] Ghidra exception em', rel, ':', e);
+                const detail = e instanceof Error ? (e.stack || e.message) : String(e);
                 this.setDecompileJob(rel, 'failed', {
                     endedAt: new Date().toISOString(),
-                    error: e instanceof Error ? e.message : String(e)
+                    error: detail.slice(0, 500)
                 });
+                this.fireDecompileFailure(rel, 'ghidra', detail);
             } finally {
                 this.pendingDecompiles.delete(rel);
             }
@@ -612,5 +646,6 @@ export class ContextManager {
     dispose() {
         this.disposables.forEach(d => d.dispose());
         try { this._onDecompileProgress.dispose(); } catch { /* ignore */ }
+        try { this._onDecompileFailure.dispose(); } catch { /* ignore */ }
     }
 }

@@ -79,6 +79,7 @@ export class WsServer {
     private multiagent?: MultiAgentManagers;
     private abortRequested = false;
     private configSub: vscode.Disposable | null = null;
+    private contextSubs: vscode.Disposable[] = [];
 
     constructor(private contextManager: ContextManager, options: WsServerOptions) {
         this.token = options.token;
@@ -108,6 +109,15 @@ export class WsServer {
                 this.broadcastConfig();
             }
         });
+
+        // Falhas de decompilação chegam ao navegador (toast) mesmo com o
+        // painel do VS Code minimizado — e não dependem de uma conexão
+        // específica aberta.
+        this.contextSubs.push(
+            this.contextManager.onDecompileFailure(failure => {
+                this.broadcast({ type: 'decompileFailed', ...failure });
+            })
+        );
 
         this.wss.on('connection', (ws) => {
             const pending = new Map<string, ChangeKind>();
@@ -302,8 +312,9 @@ export class WsServer {
 
                     case 'request': {
                         if (m.mode === 'full' || !sentFull) {
+                            let awaitRes: { timedOut: boolean; stillPending: string[] } = { timedOut: false, stillPending: [] };
                             try {
-                                await this.contextManager.awaitDecompiles(45000);
+                                awaitRes = await this.contextManager.awaitDecompiles(45000);
                             } catch { /* segue com o que já tem */ }
 
                             const useBudget = vscode.workspace.getConfiguration('deepseekContextSync')
@@ -323,7 +334,9 @@ export class WsServer {
                             send({
                                 type: 'context', mode: 'full', data: r.text,
                                 tree: this.contextManager.buildTree(),
-                                files: r.files, chars: r.chars, omitted: r.omitted.length
+                                files: r.files, chars: r.chars, omitted: r.omitted.length,
+                                decompileTimedOut: awaitRes.timedOut,
+                                decompilePending: awaitRes.stillPending
                             });
                         } else {
                             const r = this.contextManager.buildDelta(pending);
@@ -717,11 +730,15 @@ export class WsServer {
         return sel.files;
     }
 
-    private broadcastConfig(): void {
-        const payload = JSON.stringify({ type: 'config', timeouts: timeoutsPayload() });
+    private broadcast(payload: object): void {
+        const data = JSON.stringify(payload);
         for (const client of this.wss.clients) {
-            if (client.readyState === WebSocket.OPEN) client.send(payload);
+            if (client.readyState === WebSocket.OPEN) client.send(data);
         }
+    }
+
+    private broadcastConfig(): void {
+        this.broadcast({ type: 'config', timeouts: timeoutsPayload() });
     }
 
     setApplyHandler(handler: ApplyHandler) { this.applyHandler = handler; }
@@ -737,6 +754,8 @@ export class WsServer {
 
     dispose() {
         this.configSub?.dispose();
+        for (const s of this.contextSubs) { try { s.dispose(); } catch { /* ignore */ } }
+        this.contextSubs = [];
         try {
             for (const client of this.wss.clients) {
                 try { client.terminate(); } catch { /* ignore */ }

@@ -163,6 +163,8 @@
                 this._notify('sessionRegistered', msg);
             } else if (t === 'decompileProgress') {
                 this._notify('decompileProgress', msg);
+            } else if (t === 'decompileFailed') {
+                this._notify('decompileFailed', msg);
             }
         }
 

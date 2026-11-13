@@ -88,6 +88,8 @@
             this.selectionState = null;
             this._toastTimer = null;
             this._decompileProgress = null;
+            this._decompileFailureTimer = null;
+            this._decompileFailureCounts = null;
             this._els = {};
             this._build();
             state.subscribe(s => this.update(s));
@@ -280,6 +282,31 @@
         showDecompileProgress(snap) {
             this._decompileProgress = snap || null;
             this.update(state && { state: state.state, connected: state.connected });
+        }
+
+        /**
+         * Toast agregado para falhas de decompilação. Se 5 DLLs falharem por
+         * "Ghidra encerrou com código 1", sai uma linha só ("5× Ghidra encerrou
+         * com código 1"), em vez de 5 toasts que se sobrescrevem.
+         */
+        showDecompileFailure(failure) {
+            if (!failure || !failure.rel) return;
+            const key = (failure.kind || '?') + '|' +
+                String(failure.reason || 'erro').split(/[.:\n]/)[0].trim().slice(0, 80);
+            this._decompileFailureCounts = this._decompileFailureCounts || new Map();
+            this._decompileFailureCounts.set(key, (this._decompileFailureCounts.get(key) || 0) + 1);
+
+            clearTimeout(this._decompileFailureTimer);
+            this._decompileFailureTimer = setTimeout(() => {
+                const groups = [];
+                for (const [k, n] of this._decompileFailureCounts.entries()) {
+                    const reason = k.split('|')[1];
+                    groups.push(n > 1 ? `${n}× ${reason}` : reason);
+                }
+                this._decompileFailureCounts.clear();
+                const label = groups.length > 1 ? groups.join('; ') : groups[0];
+                this.toast(`🔬 ${failure.kind === 'ghidra' ? 'Ghidra' : 'ILSpy'} falhou: ${label}. Abra o Output "DeepSeek Decompilação" no VS Code para detalhes.`);
+            }, 1200);
         }
 
         update(s) {

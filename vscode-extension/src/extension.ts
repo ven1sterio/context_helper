@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { ContextManager, DecompileProgressSnapshot } from './contextManager';
+import { ContextManager, DecompileProgressSnapshot, DecompileFailure } from './contextManager';
 import { ApplyManager } from './applyManager';
 import { WsServer } from './wsServer';
 import { TaskRunner } from './taskRunner';
@@ -152,6 +152,33 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
             decompileChannel.show(true);
         })
     );
+
+    // --- Falhas de decompilação: saem do console e chegam ao usuário ---
+    const notifiedFailures = new Set<string>();
+    context.subscriptions.push(contextManager.onDecompileFailure((failure: DecompileFailure) => {
+        const ts = new Date().toLocaleTimeString();
+        decompileChannel.appendLine(`[${ts}] ❌ ${failure.kind} ${failure.rel}`);
+        for (const line of failure.detail.split('\n')) {
+            decompileChannel.appendLine('    ' + line);
+        }
+
+        // Dedup: o MESMO motivo (por tipo de ferramenta) não vira pop-up duas vezes
+        // na mesma sessão. 50 DLLs com "Ghidra encerrou com código 1" → 1 pop-up.
+        const reasonKey = failure.kind + '|' + failure.reason;
+        if (notifiedFailures.has(reasonKey)) return;
+        notifiedFailures.add(reasonKey);
+
+        const extra = failure.kind === 'ghidra'
+            ? ' Verifique o Output "DeepSeek Decompilação" para o log do Ghidra (caminho do launcher, JDK, tempo limite).'
+            : ' Verifique o Output "DeepSeek Decompilação" para o stderr do ilspycmd.';
+
+        void vscode.window.showErrorMessage(
+            `DeepSeek: falha ao decompilar ${failure.rel} — ${failure.reason}.${extra}`,
+            'Ver log'
+        ).then(choice => {
+            if (choice === 'Ver log') decompileChannel.show(true);
+        });
+    }));
 
     const indexer = new Indexer(workspaceRoot);
     try {

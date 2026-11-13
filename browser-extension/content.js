@@ -105,6 +105,9 @@
         conn.on('decompileProgress', (msg) => {
             panel.showDecompileProgress(msg);
         });
+        conn.on('decompileFailed', (msg) => {
+            panel.showDecompileFailure(msg);
+        });
         conn.on('applyResult', (msg) => {
             const icon = msg.status === 'applied' ? '✅' : msg.status === 'cancelled' ? '⏹' : '❌';
             panel.toast(`${icon} ${msg.message || msg.status}`);
