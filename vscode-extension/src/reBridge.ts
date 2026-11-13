@@ -503,3 +503,37 @@ export async function handleReRequests(requests: ReRequest[], ctx: ReContext): P
     }
     return { ok: results.every(r => r.ok), text: parts.join('\n\n'), results };
 }
+
+// ---------------------------------------------------------------- decompilação em massa
+/**
+ * Decompila o binário INTEIRO via Ghidra headless usando o op `decompile-all`
+ * do ReBridge.java. Usado pelo contextManager para enriquecer o contexto com
+ * pseudo-C sem precisar de um pedido explícito da IA.
+ *
+ * O `op` não está em RE_OPS/ReOp de propósito: `decompile-all` é uma operação
+ * INTERNA (chamada pelo contextManager), não uma operação que a IA do chat
+ * pode pedir. Por isso a validação em security/messageValidator.ts continua
+ * recusando `decompile-all` vindo do navegador.
+ */
+export async function decompileNativeAll(
+    rel: string,
+    ctx: ReContext,
+    opts: { limit?: number; maxChars?: number } = {}
+): Promise<{ ok: boolean; text: string }> {
+    try {
+        const file = locateBinary(ctx.workspaceRoot, rel);
+        const req = {
+            op: 'decompile-all',
+            file: rel,
+            args: [],
+            opts: {
+                limit: String(opts.limit ?? 40),
+                max_chars: String(opts.maxChars ?? (ctx.maxDecompiledChars ?? 200_000)),
+            },
+        } as unknown as ReRequest;
+        const text = await runGhidra(req, ctx, file);
+        return { ok: true, text };
+    } catch (e) {
+        return { ok: false, text: 'ERRO: ' + (e instanceof Error ? e.message : String(e)) };
+    }
+}
