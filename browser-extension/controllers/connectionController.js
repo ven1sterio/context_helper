@@ -48,6 +48,7 @@
             this.waitingSelection = null;
             this.waitingState = null;
             this.waitingMissionStart = null;
+            this.waitingRE = null;
 
             this.reconnectAttempts = 0;
 
@@ -132,6 +133,8 @@
                 this._finish('waitingState', msg);
             } else if (t === 'missionStarted') {
                 this._finish('waitingMissionStart', msg);
+            } else if (t === 'reResult') {
+                this._finish('waitingRE', msg);
             } else if (t === 'aborted') {
                 // ignore
             } else if (t === 'error') {
@@ -170,7 +173,7 @@
         }
 
         _cancelAllWaiters(reason) {
-            const props = ['waiting', 'waitingApplyResult', 'waitingSelection', 'waitingState', 'waitingMissionStart'];
+            const props = ['waiting', 'waitingApplyResult', 'waitingSelection', 'waitingState', 'waitingMissionStart', 'waitingRE'];
             for (const p of props) {
                 if (this[p]) {
                     const w = this[p];
@@ -265,6 +268,21 @@
                 );
                 this.waitingApplyResult = { resolve, timer };
                 this.ws.send(JSON.stringify({ type: 'applyFiles', files }));
+            });
+        }
+
+        /** Envia pedidos de engenharia reversa ao VS Code e espera o texto de resultado. */
+        requestRE(requests) {
+            return new Promise((resolve) => {
+                if (!this.isOpen()) { resolve({ ok: false, text: 'Sem conexão com o VS Code.' }); return; }
+                if (this.waitingRE) { resolve({ ok: false, text: 'Já existe um pedido RE em andamento.' }); return; }
+                // A 1ª análise de uma DLL grande no Ghidra pode levar dezenas de minutos.
+                const timer = setTimeout(
+                    () => this._finish('waitingRE', { ok: false, text: 'Timeout aguardando a engenharia reversa (a análise pode ainda estar rodando no VS Code; repita o pedido depois).' }),
+                    40 * 60 * 1000
+                );
+                this.waitingRE = { resolve, timer };
+                this.ws.send(JSON.stringify({ type: 'reRequest', requests }));
             });
         }
 

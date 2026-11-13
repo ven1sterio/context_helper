@@ -46,6 +46,9 @@ export interface ApplyOptions {
     conflicts?: string[];
 }
 
+export interface ReHandlerResult { ok: boolean; text: string; results?: unknown[] }
+export type ReHandler = (requests: any[]) => Promise<ReHandlerResult>;
+
 export type ApplyHandler = (files: unknown, options?: ApplyOptions) => Promise<ApplyResult>;
 
 export interface WsServerOptions {
@@ -66,6 +69,7 @@ export class WsServer {
     private token: string;
     private applyHandler?: ApplyHandler;
     private applyAbortHandler?: () => void;
+    private reHandler?: ReHandler;
     private runner?: TaskRunner;
     private indexer?: Indexer;
     private graphStore?: GraphStore;
@@ -335,6 +339,20 @@ export class WsServer {
                                 tree: sendTree ? this.contextManager.buildTree() : undefined,
                                 files: r.included.length, chars: r.chars, remaining: pending.size
                             });
+                        }
+                        return;
+                    }
+
+                    case 'reRequest': {
+                        if (!this.reHandler) {
+                            send({ type: 'reResult', ok: false, text: 'Engenharia reversa não está disponível nesta instância do VS Code.' });
+                            return;
+                        }
+                        try {
+                            const r = await this.reHandler(m.requests);
+                            send({ type: 'reResult', ok: r.ok, text: r.text, results: r.results });
+                        } catch (e) {
+                            send({ type: 'reResult', ok: false, text: 'ERRO: ' + (e instanceof Error ? e.message : String(e)) });
                         }
                         return;
                     }
@@ -715,6 +733,7 @@ export class WsServer {
     setIndexer(indexer: Indexer) { this.indexer = indexer; }
     setGraphStore(store: GraphStore) { this.graphStore = store; }
     setStateManager(mgr: StateManager) { this.stateManager = mgr; }
+    setReHandler(fn: ReHandler) { this.reHandler = fn; }
     setAgentManagers(m: AgentManagers) { this.agents = m; }
     setMultiAgentManagers(m: MultiAgentManagers) { this.multiagent = m; }
     getToken(): string { return this.token; }

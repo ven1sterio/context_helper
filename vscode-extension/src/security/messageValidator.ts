@@ -49,7 +49,19 @@ export type ValidatedMessage =
     | { type: 'cancelMultiAgentMission'; reason: string }
     | { type: 'getMultiAgentState' }
     | { type: 'registerSession'; sessionId: string; provider: string }
-    | { type: 'markSessionUnavailable'; sessionId: string };
+    | { type: 'markSessionUnavailable'; sessionId: string }
+    | { type: 'reRequest'; requests: ReRequestMessage[] };
+
+export interface ReRequestMessage {
+    op: string;
+    file: string;
+    args: string[];
+    opts: Record<string, string>;
+}
+
+const RE_OPS = new Set(['info', 'functions', 'decompile', 'disasm', 'xrefs', 'strings', 'asm', 'patch']);
+const MAX_RE_REQUESTS = 8;
+const MAX_RE_FIELD = 2000;
 
 export type ValidationResult =
     | { ok: true; message: ValidatedMessage }
@@ -311,6 +323,33 @@ export function validateMessage(raw: unknown): ValidationResult {
         case 'markSessionUnavailable': {
             if (!isString(m.sessionId) || m.sessionId.length > 200) return fail('markSessionUnavailable: "sessionId" inválido');
             return { ok: true, message: { type: 'markSessionUnavailable', sessionId: m.sessionId } };
+        }
+
+        case 'reRequest': {
+            if (!Array.isArray(m.requests) || m.requests.length === 0 || m.requests.length > MAX_RE_REQUESTS) {
+                return fail(`reRequest: "requests" deve ter de 1 a ${MAX_RE_REQUESTS} pedidos`);
+            }
+            const requests: ReRequestMessage[] = [];
+            for (const r of m.requests as unknown[]) {
+                if (!r || typeof r !== 'object') return fail('reRequest: pedido inválido');
+                const it = r as Record<string, unknown>;
+                if (!isString(it.op) || !RE_OPS.has(it.op)) return fail('reRequest: "op" desconhecida');
+                if (!isString(it.file) || it.file.length === 0 || it.file.length > MAX_FILEPATH_CHARS) return fail('reRequest: "file" inválido');
+                const args = checkStringArray(it.args ?? [], 8, MAX_RE_FIELD);
+                if (args === null) return fail('reRequest: "args" inválido');
+                const opts: Record<string, string> = {};
+                if (it.opts !== undefined) {
+                    if (!it.opts || typeof it.opts !== 'object' || Array.isArray(it.opts)) return fail('reRequest: "opts" inválido');
+                    const entries = Object.entries(it.opts as Record<string, unknown>);
+                    if (entries.length > 16) return fail('reRequest: opções demais');
+                    for (const [k, v] of entries) {
+                        if (!/^[a-z_]{1,32}$/.test(k) || !isString(v) || v.length > MAX_RE_FIELD) return fail(`reRequest: opção "${k}" inválida`);
+                        opts[k] = v;
+                    }
+                }
+                requests.push({ op: it.op, file: it.file, args, opts });
+            }
+            return { ok: true, message: { type: 'reRequest', requests } };
         }
 
         default:

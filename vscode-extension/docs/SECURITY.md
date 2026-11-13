@@ -30,3 +30,14 @@ O sistema foi projetado para ser seguro por padrão, protegendo o projeto contra
 ## 6. Detecção de Conflitos (`fileFingerprint.ts`)
 - Ao enviar o contexto, o sistema guarda um hash SHA-1 dos arquivos enviados.
 - Se o usuário alterar o arquivo no VS Code enquanto o modelo pensa, ao tentar aplicar a edição o sistema detecta a mudança e bloqueia a sobrescrita, avisando o usuário.
+
+## Engenharia reversa (`reRequest`)
+
+- Tipo de mensagem validado em `security/messageValidator.ts` (máx. 8 pedidos, operações em lista fechada, campos com limite de tamanho).
+- `reBridge.ts` só resolve arquivos dentro do workspace e com extensão de binário conhecida.
+- O ILSpy é iniciado com `execFile`, sem shell. O Ghidra é iniciado diretamente com argumentos separados em Linux/macOS.
+- No Windows, `analyzeHeadless.bat` exige `cmd.exe`. A extensão usa `/d /s /c`, coloca os argumentos entre aspas e rejeita aspas, metacaracteres de shell e quebras de linha nos argumentos.
+- Em caso de timeout, a extensão encerra também os processos descendentes do launcher, evitando deixar processos Java do Ghidra rodando em segundo plano.
+- A saída do `ReBridge.java` é validada; códigos de saída diferentes de zero, arquivos ausentes, saídas vazias e marcadores de erro não são considerados análises bem-sucedidas.
+- Nomes de tipo .NET são validados antes de ir ao `ilspycmd` (não podem começar com `-`).
+- `patch` nunca grava sem `confirm` do usuário (diálogo modal) e confere os bytes originais.

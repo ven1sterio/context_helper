@@ -92,6 +92,13 @@
             return (input.innerText || input.textContent || '').replace(/\u200B/g, '').replace(/\r\n/g, '\n');
         }
 
+        /**
+         * Cola texto no editor. NÃO verificar `got()` logo depois do paste —
+         * o ProseMirror processa o evento de forma assíncrona, então o check
+         * imediato daria falso negativo e o `insertText` de fallback
+         * DUPLICARIA o conteúdo. Aqui fazemos UMA ÚNICA estratégia: paste
+         * sintético. Se ele falhar, quem chama usa `setInputChunked`.
+         */
         setInput(input, text) {
             if (!input) return;
             if (input.tagName === 'TEXTAREA') {
@@ -106,39 +113,12 @@
             try { document.execCommand('selectAll', false, null); } catch { /* ignore */ }
             try { document.execCommand('delete', false, null); } catch { /* ignore */ }
 
-            // Tenta colar via evento sintético (rápido para textos grandes no ProseMirror)
-            let pasted = false;
             try {
                 const dt = new DataTransfer();
                 dt.setData('text/plain', text);
                 const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
                 input.dispatchEvent(ev);
-                pasted = true;
-            } catch { pasted = false; }
-
-            const expected = text.replace(/\s+/g, '').length;
-            const got = () => (input.textContent || '').replace(/\s+/g, '').length;
-
-            if (!pasted || got() < expected * 0.9) {
-                try {
-                    document.execCommand('selectAll', false, null);
-                    document.execCommand('insertText', false, text);
-                } catch { /* ignore */ }
-            }
-            
-            // Fallback final: monta parágrafos
-            if (got() < expected * 0.9) {
-                input.textContent = '';
-                const frag = document.createDocumentFragment();
-                for (const line of text.split('\n')) {
-                    const p = document.createElement('p');
-                    if (line.length === 0) p.appendChild(document.createElement('br'));
-                    else p.textContent = line;
-                    frag.appendChild(p);
-                }
-                input.appendChild(frag);
-                input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' }));
-            }
+            } catch { /* ignore */ }
         }
 
         async setInputChunked(input, text, onProgress) {

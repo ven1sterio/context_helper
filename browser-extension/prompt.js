@@ -113,9 +113,52 @@ const RESPONSE_RULES = [
     FENCE
 ].join('\n');
 
+
+const RE_RULES = [
+    '',
+    'FORMATO F — ENGENHARIA REVERSA DE DLL/EXE (ler, entender, alterar binários):',
+    'Você NÃO vê o binário diretamente. Para olhar dentro dele, peça com UMA linha por pedido (sem cerca de código):',
+    'REGRA PRINCIPAL: se o usuário pedir para ver, entender, otimizar ou alterar o conteúdo, as funções ou o código de uma',
+    'DLL/EXE (ou se você precisar de uma função decompilada), NÃO responda que "não consegue ver" e NÃO liste o que "falta".',
+    'Emita os pedidos "### RE:" NESTA MESMA resposta e deixe o sistema executá-los. Comece por functions/strings para localizar',
+    'o alvo e depois decompile. O resumo de imports/exports/strings do contexto NÃO é o código: para o código, peça decompile.',
+    '',
+    '### RE: info Qt6OpenGL.dll                       (formato, arquitetura, seções, imagebase)',
+    '### RE: functions Qt6OpenGL.dll filter=Shader limit=50',
+    '### RE: decompile Qt6OpenGL.dll NomeDaFuncao     (pseudo-C + quem chama + quem é chamada; aceita 0x endereço)',
+    '### RE: disasm Qt6OpenGL.dll 0x180001000 count=40',
+    '### RE: xrefs Qt6OpenGL.dll NomeDaFuncao          (quem referencia)',
+    '### RE: strings Qt6OpenGL.dll "texto a procurar"  (com as funções que usam a string)',
+    '### RE: asm Qt6OpenGL.dll addr=0x180001000 text="nop"   (converte instrução em bytes)',
+    '### RE: patch Qt6OpenGL.dll rva=0x1A2B expect="48 89 5C 24 08" write="90 90 90 90 90"',
+    '',
+    'Regras do RE:',
+    '- O sistema executa e devolve o resultado na próxima mensagem. Peça por função, nunca a DLL inteira.',
+    '- Binário .NET (gerenciado): o sistema usa o ILSpy. info/functions/strings/patch funcionam; decompile aceita o nome do TIPO',
+    '  (Namespace.Classe) e devolve C#; disasm do tipo devolve IL; xrefs e asm não existem para .NET. Para editar a lógica .NET,',
+    '  prefira o projeto C# gerado em decompiled/<nome> (comando "Decompilar DLL .NET para projeto C#") e recompilar.',
+    '- Máximo de 8 pedidos por resposta. Termine a resposta normalmente com ' + '[[STATUS:CONTINUAR]]' + ' enquanto estiver investigando.',
+    '- O pseudo-C vem do Ghidra: é aproximação (nomes de variáveis inventados, sem PDB não há nomes de funções internas).',
+    '  Não trate como código-fonte original e diga quando estiver inferindo.',
+    '- Se existir código-fonte (.c/.cpp) do mesmo binário no projeto, prefira editar o código-fonte e recompilar.',
+    '- PATCH: write tem que ter o MESMO tamanho de expect. expect é conferido contra o arquivo; se não casar, nada é gravado.',
+    '  Por padrão grava uma cópia "nome.patched.dll"; o original fica intocado. O usuário precisa aprovar no VS Code.',
+    '  Antes de propor um patch, mostre a função decompilada, o endereço exato e o risco.',
+    '- Não misture pedidos RE com blocos FILE:/EDIT: na mesma resposta (os blocos seriam ignorados).'
+].join('\n');
+
+function buildReResultPrompt({ text, errors, ignoredFiles }) {
+    const parts = ['[RESULTADO DA ENGENHARIA REVERSA]', text || '(sem saída)'];
+    if (errors && errors.length) parts.push('', 'Pedidos RE inválidos (corrija a sintaxe):', ...errors.map(e => '- ' + e));
+    if (ignoredFiles) parts.push('', 'ATENÇÃO: os blocos FILE:/EDIT: da sua resposta anterior NÃO foram aplicados (não misture com RE). Reenvie depois.');
+    parts.push('', 'Continue a investigação ou conclua. Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e [[FIM-DA-RESPOSTA]].');
+    return parts.join('\n');
+}
+
 const DELTA_REMINDER =
     'Mantenha as mesmas regras: para alterar arquivos, use "### FILE:" com o arquivo COMPLETO ' +
-    'ou "EDIT:" com blocos SEARCH/REPLACE exatos. Sem trechos e sem "...".';
+    'ou "EDIT:" com blocos SEARCH/REPLACE exatos. Sem trechos e sem "...". ' +
+    'Para olhar/alterar binários (.dll/.exe) continue usando as linhas "### RE: operação arquivo ...".';
 
 // ---------------------------------------------------------------------------
 // Modo Full Code (agente autônomo)
@@ -165,6 +208,7 @@ const FULL_CODE_RULES = [
 function buildFullPrompt({ tree, context, question, fullCode }) {
     const parts = [
         RESPONSE_RULES,
+        RE_RULES,
         fullCode ? FULL_CODE_RULES : '',
         '',
         'Estrutura do projeto:',

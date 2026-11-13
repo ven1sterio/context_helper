@@ -244,6 +244,26 @@
             const status = p.readStatus(p.messageText(answerNode));
             const parsed = parseLastResponse();
 
+            // Engenharia reversa: a IA pediu para olhar/alterar um binário. Executa no VS Code
+            // e devolve o resultado como próxima mensagem (não conta como falha).
+            const re = scanReRequests(p.messageText(answerNode));
+            if (re.requests.length || re.errors.length) {
+                let text = '';
+                if (re.requests.length) {
+                    window.DS.panel.toast(`🔬 Engenharia reversa: ${re.requests.length} pedido(s)... (a 1ª análise de uma DLL pode demorar)`);
+                    const rr = await conn.requestRE(re.requests);
+                    text = (rr && rr.text) || '(sem resposta do VS Code)';
+                }
+                failures = 0;
+                promptText = buildReResultPrompt({
+                    text,
+                    errors: re.errors,
+                    ignoredFiles: !!(parsed && parsed.files && parsed.files.length)
+                });
+                state.transition(STATES.RUNNING);
+                continue;
+            }
+
             if (parsed.error) {
                 if (status === 'continue') {
                     failures++;

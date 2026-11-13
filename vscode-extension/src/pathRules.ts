@@ -34,6 +34,8 @@ export const TEXT_EXTENSIONS = new Set([
     // Linguagens comuns
     '.py', '.pyi', '.java', '.kt', '.kts', '.scala',
     '.go', '.rs', '.rb', '.php', '.cs', '.fs', '.vb',
+    // Projeto .NET (o ILSpy gera .csproj ao decompilar para projeto)
+    '.csproj', '.fsproj', '.vbproj', '.sln', '.props', '.targets', '.resx',
     '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.hh', '.hxx', '.m', '.mm',
     '.html', '.htm', '.css', '.scss', '.sass', '.less', '.styl',
     '.vue', '.svelte', '.astro',

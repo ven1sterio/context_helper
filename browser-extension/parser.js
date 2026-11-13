@@ -489,3 +489,69 @@ function parseLastResponse() {
     }
     return { files, problems };
 }
+
+// ---------------------------------------------------------------------------
+// Engenharia reversa de binários (DLL/EXE): "### RE: operação arquivo [args]"
+// Uma linha = um pedido. O VS Code executa (Ghidra headless / patch PE) e devolve o texto.
+// ---------------------------------------------------------------------------
+const RE_MAX_REQUESTS = 8;
+const RE_OPS = new Set(['info', 'functions', 'decompile', 'disasm', 'xrefs', 'strings', 'asm', 'patch']);
+
+function tokenizeReArgs(s) {
+    const re = /(?:[^\s"']+=)?"[^"]*"|(?:[^\s"']+=)?'[^']*'|\S+/g;
+    const unq = (v) => v.replace(/^(["'])([\s\S]*)\1$/, '$2');
+    const args = [];
+    const opts = {};
+    let m;
+    while ((m = re.exec(String(s))) !== null) {
+        const km = /^([A-Za-z_]+)=([\s\S]*)$/.exec(m[0]);
+        if (km) opts[km[1].toLowerCase()] = unq(km[2]);
+        else args.push(unq(m[0]));
+    }
+    return { args, opts };
+}
+
+function validateReRequest(r) {
+    const o = r.opts;
+    switch (r.op) {
+        case 'info': case 'functions': return null;
+        case 'decompile': case 'disasm': case 'xrefs':
+            return r.args.length ? null : 'faltou o alvo (nome da função ou endereço 0x...)';
+        case 'strings':
+            return r.args.length ? null : 'faltou o texto a procurar';
+        case 'asm':
+            return (o.addr && (o.text || r.args.length)) ? null : 'use addr=0x... text="instrução"';
+        case 'patch':
+            if (!(o.rva || o.addr || o.offset)) return 'faltou rva=, addr= ou offset=';
+            if (!o.expect || !o.write) return 'faltam expect="bytes originais" e write="bytes novos"';
+            return null;
+    }
+    return 'operação desconhecida';
+}
+
+/** Retorna { requests: [{op,file,args,opts}], errors: [string] } a partir de qualquer texto. */
+function scanReRequests(text) {
+    const requests = [];
+    const errors = [];
+    const seen = new Set();
+    const re = /^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?RE[ \t]*:[ \t]*(.+?)[ \t]*$/gim;
+    let m;
+    while ((m = re.exec(String(text))) !== null) {
+        const body = m[1].replace(/\*+$/, '').trim();
+        const sp = body.split(/\s+/);
+        const op = (sp[0] || '').toLowerCase();
+        if (!RE_OPS.has(op)) continue; // "RE: assunto de email" etc. não é pedido
+        const { args, opts } = tokenizeReArgs(body.slice(sp[0].length));
+        const file = args.shift();
+        if (!file || !isPlausiblePath(cleanPath(file))) { errors.push(`RE: ${body} → faltou o arquivo`); continue; }
+        const req = { op, file: cleanPath(file), args, opts };
+        const bad = validateReRequest(req);
+        if (bad) { errors.push(`RE: ${body} → ${bad}`); continue; }
+        const key = JSON.stringify(req);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (requests.length >= RE_MAX_REQUESTS) { errors.push(`máximo de ${RE_MAX_REQUESTS} pedidos RE por resposta; ignorado: ${body}`); continue; }
+        requests.push(req);
+    }
+    return { requests, errors };
+}

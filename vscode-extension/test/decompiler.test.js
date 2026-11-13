@@ -3,7 +3,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { decompileAssembly, isFrameworkAssembly, Limiter } = require('../out/decompiler');
+const { decompileAssembly, decompileToProject, isFrameworkAssembly, Limiter } = require('../out/decompiler');
 
 // Usa um "ilspycmd" falso (script sh); não roda no Windows.
 const skip = process.platform === 'win32' ? 'script sh não roda no Windows' : false;
@@ -76,4 +76,27 @@ test('Limiter respeita o máximo de tarefas simultâneas', async () => {
     });
     await Promise.all([task(), task(), task(), task(), task()]);
     assert.strictEqual(peak, 2);
+});
+
+test('decompileToProject: chama ilspycmd -p -o <dir> <dll> e os arquivos aparecem', { skip }, async () => {
+    // fake: $1=-p $2=-o $3=<outDir> $4=<dll>
+    const exe = fake('proj', 'test "$1" = "-p" && test "$2" = "-o" || exit 9; mkdir -p "$3"; echo "class A {}" > "$3/A.cs"; echo "<Project/>" > "$3/Lib.csproj"');
+    const out = path.join(dir, 'saida-projeto');
+    const r = await decompileToProject('/x/Lib.dll', out, { exePath: exe, timeoutMs: 5_000 });
+    assert.strictEqual(r.ok, true);
+    assert.ok(fs.existsSync(path.join(out, 'A.cs')));
+    assert.ok(fs.existsSync(path.join(out, 'Lib.csproj')));
+});
+
+test('decompileToProject: ferramenta ausente -> not-installed', async () => {
+    const r = await decompileToProject('/x/Lib.dll', '/tmp/x', { exePath: '/nao/existe/ilspycmd', timeoutMs: 2_000 });
+    assert.deepStrictEqual([r.ok, r.reason], [false, 'not-installed']);
+});
+
+test('decompileToProject: falha do ilspycmd -> failed com stderr', { skip }, async () => {
+    const exe = fake('projfail', 'echo "not a managed assembly" >&2; exit 1');
+    const r = await decompileToProject('/x/Native.dll', path.join(dir, 'o2'), { exePath: exe, timeoutMs: 5_000 });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reason, 'failed');
+    assert.match(r.detail, /not a managed assembly/);
 });

@@ -22,8 +22,12 @@ import { SessionRouter } from './multiagent/sessionRouter';
 import { TaskDispatcher } from './multiagent/taskDispatcher';
 import { runHealthCheck } from './diagnostics/healthCheck';
 import { showReport } from './diagnostics/diagnosticReport';
+import { decompileToProject } from './decompiler';
+import { handleReRequests } from './reBridge';
+import * as path from 'path';
 
 const TOKEN_KEY = 'deepseekContextSync.token';
+const LOG = '[DeepSeek Context Sync]';
 
 function generateToken(): string {
     return crypto.randomBytes(24).toString('hex');
@@ -34,7 +38,7 @@ export async function activate(context: vscode.ExtensionContext) {
         await activateInternal(context);
     } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        console.error('[DeepSeek Context Sync] falha na ativação:', e);
+        console.error(LOG, 'falha na ativação:', e);
         vscode.window.showErrorMessage(
             `DeepSeek Context Sync: falha ao ativar — ${maskSecrets(msg)}`
         );
@@ -42,11 +46,33 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 async function activateInternal(context: vscode.ExtensionContext) {
+    // Timer de diagnóstico: se algum `await` travar, avisa o usuário.
+    let timedOut = false;
+    const timer = setTimeout(() => {
+        timedOut = true;
+        console.warn(LOG, 'ativação demorou > 30s; verifique o Output para ver a etapa travada.');
+        vscode.window.showWarningMessage(
+            'DeepSeek Context Sync: a ativação está demorando. Veja o Output (dropdown "DeepSeek Context Sync") para diagnosticar.'
+        );
+    }, 30000);
+
+    try {
+        await activateSteps(context, () => timedOut);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () => boolean) {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceRoot) {
-        vscode.window.showErrorMessage('Abra uma pasta de projeto primeiro.');
+        console.warn(LOG, 'sem workspace; abortando (abra uma pasta antes de usar a extensão).');
+        vscode.window.showErrorMessage(
+            'DeepSeek Context Sync: abra uma pasta de projeto primeiro (File → Open Folder) e recarregue.'
+        );
         return;
     }
+    console.log(LOG, 'workspace:', workspaceRoot);
 
     setAllowSensitive(
         vscode.workspace.getConfiguration('deepseekContextSync').get<boolean>('allowSensitiveFiles', false)
@@ -58,50 +84,95 @@ async function activateInternal(context: vscode.ExtensionContext) {
         await context.globalState.update(TOKEN_KEY, token);
     }
 
+    // ---------- ContextManager ----------
     const contextManager = new ContextManager(workspaceRoot);
-    await contextManager.initialize();
+    try {
+        console.log(LOG, 'inicializando ContextManager...');
+        await contextManager.initialize();
+        console.log(LOG, 'ContextManager OK');
+    } catch (e) {
+        console.error(LOG, 'ContextManager falhou:', e);
+        vscode.window.showErrorMessage(
+            'DeepSeek Context Sync: falha ao ler o workspace. Verifique se a pasta está acessível e recarregue.'
+        );
+        return;
+    }
 
+    // ---------- Indexer ----------
     const indexer = new Indexer(workspaceRoot);
-    await indexer.initialize(contextManager);
+    try {
+        console.log(LOG, 'inicializando Indexer...');
+        await indexer.initialize(contextManager);
+        console.log(LOG, 'Indexer OK');
+    } catch (e) {
+        console.error(LOG, 'Indexer falhou:', e);
+        vscode.window.showWarningMessage(
+            'DeepSeek Context Sync: o Indexer falhou. O contexto completo e o Full Code podem não funcionar.'
+        );
+    }
 
-    // ---------- Estado entre conversas ----------
+    // ---------- StateManager ----------
     const stateManager = new StateManager(workspaceRoot);
-    await stateManager.initialize();
+    try {
+        await stateManager.initialize();
+    } catch (e) {
+        console.warn(LOG, 'StateManager falhou:', e);
+    }
 
-    // ---------- Memória estruturada ----------
+    // ---------- ProjectMemory ----------
     const projectMemory = new ProjectMemory(workspaceRoot);
-    await projectMemory.load();
-    stateManager.setMemory(projectMemory);
+    try {
+        await projectMemory.load();
+        stateManager.setMemory(projectMemory);
+    } catch (e) {
+        console.warn(LOG, 'ProjectMemory falhou:', e);
+    }
 
+    // ---------- Apply + TaskRunner ----------
     const applyManager = new ApplyManager(workspaceRoot, {
         findDependents: (rel) => indexer.getDependentsOf(rel),
         allFilePaths: () => new Set(Object.keys(indexer.getIndex().files))
     });
     const taskRunner = new TaskRunner(workspaceRoot);
 
-    const wsServer = new WsServer(contextManager, {
-        port: 8765,
-        token,
-        onError: err => {
-            const msg = err?.message || String(err);
-            if (/token inválido/i.test(msg)) return;
-            if (/origem recusada/i.test(msg)) return;
-            const code = (err as any)?.code;
-            if (code === 'EADDRINUSE' || /EADDRINUSE|address already in use/i.test(msg)) {
+    // ---------- WsServer ----------
+    console.log(LOG, 'inicializando WsServer em 127.0.0.1:8765...');
+    let wsServer: WsServer;
+    try {
+        wsServer = new WsServer(contextManager, {
+            port: 8765,
+            token,
+            onError: err => {
+                const msg = err?.message || String(err);
+                if (/token inválido/i.test(msg)) return;
+                if (/origem recusada/i.test(msg)) return;
+                const code = (err as any)?.code;
+                if (code === 'EADDRINUSE' || /EADDRINUSE|address already in use/i.test(msg)) {
+                    vscode.window.showErrorMessage(
+                        'DeepSeek Context Sync: a porta 8765 já está em uso. ' +
+                        'Feche a OUTRA janela do Extension Development Host (ou do VS Code) que está ' +
+                        'com a extensão ativa e recarregue esta janela (Ctrl+Shift+P → Developer: Reload Window). ' +
+                        'Se persistir, encerre processos Node antigos no Gerenciador de Tarefas.'
+                    );
+                    return;
+                }
+                console.error(LOG, 'erro no WsServer:', err);
                 vscode.window.showErrorMessage(
-                    'DeepSeek Context Sync: a porta 8765 já está em uso. ' +
-                    'Feche a outra janela do Extension Development Host (ou do VS Code) ' +
-                    'que está com a extensão ativa e pressione F5 de novo. Se persistir, ' +
-                    'encerre processos Node antigos no Gerenciador de Tarefas.'
+                    `DeepSeek Context Sync: erro no servidor (${maskSecrets(msg)}). ` +
+                    'Verifique o Output para mais detalhes.'
                 );
-                return;
             }
-            vscode.window.showErrorMessage(
-                `DeepSeek Context Sync: erro no servidor (${maskSecrets(msg)}). ` +
-                'Se a porta 8765 estiver em uso, feche outras janelas de desenvolvimento.'
-            );
-        }
-    });
+        });
+        console.log(LOG, 'WsServer OK');
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(LOG, 'falha ao criar WsServer:', e);
+        vscode.window.showErrorMessage(
+            `DeepSeek Context Sync: não foi possível iniciar o servidor local (${maskSecrets(msg)}). ` +
+            'Verifique se outra instância está usando a porta 8765.'
+        );
+        return;
+    }
     wsServer.setApplyHandler((files, opts) => applyManager.apply(files, opts));
     wsServer.setApplyAbortHandler(() => applyManager.requestAbort());
     wsServer.setRunner(taskRunner);
@@ -112,6 +183,22 @@ async function activateInternal(context: vscode.ExtensionContext) {
     );
     wsServer.setGraphStore(graphStore);
     wsServer.setStateManager(stateManager);
+    wsServer.setReHandler(async (requests) => {
+        const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
+        if (!cfg.get<boolean>('reEnabled', true)) {
+            return { ok: false, text: 'Engenharia reversa desligada (deepseekContextSync.reEnabled).' };
+        }
+        return handleReRequests(requests, {
+            workspaceRoot,
+            // globalStorage não tem segmento iniciado por ponto (o Ghidra recusa ".algo" no caminho do projeto).
+            cacheDir: path.join(context.globalStorageUri.fsPath, 're'),
+            ghidraHome: cfg.get<string>('ghidraPath', '') || process.env.GHIDRA_HOME,
+            ilspyPath: cfg.get<string>('ilspyPath', 'ilspycmd'),
+            maxDecompiledChars: cfg.get<number>('maxDecompiledKB', 200) * 1024,
+            confirm: async (text) =>
+                (await vscode.window.showWarningMessage(text, { modal: true }, 'Aplicar')) === 'Aplicar'
+        });
+    });
 
     // ---------- Full Code 2.0 ----------
     const planManager = new PlanManager(workspaceRoot);
@@ -134,7 +221,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
     const sessions = new SessionRouter();
     const multiagentMission = new MissionController(
         agentRegistry, deliverables, reviews, sessions,
-        (e) => console.log('[MultiAgent]', e.kind)
+        (e) => console.log(LOG, '[MultiAgent]', e.kind)
     );
     const dispatcher = new TaskDispatcher(agentRegistry, sessions);
 
@@ -147,7 +234,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
         dispatcher
     });
 
-    // Recovery: verifica run interrompida ao ativar
+    // Recovery
     try {
         const recovery = await recoveryManager.inspect();
         if (recovery.kind === 'running') {
@@ -174,7 +261,7 @@ async function activateInternal(context: vscode.ExtensionContext) {
             await recoveryManager.saveCurrentRun(null);
         }
     } catch (e) {
-        console.error('[DeepSeek Context Sync] recovery:', e);
+        console.warn(LOG, 'recovery:', e);
     }
 
     const indexSub = contextManager.onDidChange(e => {
@@ -216,6 +303,67 @@ async function activateInternal(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('deepseekContextSync.decompileDllToProject', async (uri?: vscode.Uri) => {
+            let target = uri;
+            if (!target) {
+                const picked = await vscode.window.showOpenDialog({
+                    canSelectMany: false,
+                    defaultUri: vscode.Uri.file(workspaceRoot),
+                    filters: { 'Assemblies .NET': ['dll', 'exe'] },
+                    openLabel: 'Decompilar',
+                });
+                target = picked?.[0];
+            }
+            if (!target) return;
+
+            const name = path.basename(target.fsPath).replace(/\.(dll|exe)$/i, '');
+            const outDir = path.join(workspaceRoot, 'decompiled', name);
+            const outUri = vscode.Uri.file(outDir);
+
+            let exists = false;
+            try { exists = (await vscode.workspace.fs.readDirectory(outUri)).length > 0; } catch { /* não existe */ }
+            if (exists) {
+                const choice = await vscode.window.showWarningMessage(
+                    `A pasta decompiled/${name} já existe. Substituir apaga as edições feitas nela.`,
+                    { modal: true },
+                    'Substituir'
+                );
+                if (choice !== 'Substituir') return;
+                await vscode.workspace.fs.delete(outUri, { recursive: true, useTrash: false });
+            }
+
+            const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
+            const res = await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Decompilando ${name} com o ILSpy…` },
+                () => decompileToProject(target!.fsPath, outDir, {
+                    exePath: cfg.get<string>('ilspyPath', 'ilspycmd') || 'ilspycmd',
+                    timeoutMs: 300_000,
+                })
+            );
+
+            if (!res.ok) {
+                if (res.reason === 'not-installed') {
+                    vscode.window.showErrorMessage(
+                        'ILSpy não encontrado. Instale com: dotnet tool install --global ilspycmd ' +
+                        '(ou ajuste "deepseekContextSync.ilspyPath").'
+                    );
+                } else {
+                    vscode.window.showErrorMessage(
+                        `Falha ao decompilar ${name} (${res.reason}): ${res.detail}. ` +
+                        'Se for uma DLL nativa (C/C++), o ILSpy não a suporta.'
+                    );
+                }
+                return;
+            }
+
+            vscode.window.showInformationMessage(
+                `Projeto C# gerado em decompiled/${name}. Os arquivos já entram no contexto; ` +
+                `depois de editar, recompile com: dotnet build decompiled/${name}`
+            );
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand('deepseekContextSync.diagnose', () => {
             const report = runHealthCheck({
                 workspaceRoot,
@@ -236,18 +384,20 @@ async function activateInternal(context: vscode.ExtensionContext) {
         8000
     );
 
+    console.log(LOG, 'ativação concluída' + (isTimedOut() ? ' (com aviso de lentidão)' : ''));
+
     context.subscriptions.push({
         dispose: () => {
-            cfgSub.dispose();
-            indexSub.dispose();
-            projectMemory.dispose();
-            stateManager.dispose();
-            planManager.dispose();
-            indexer.dispose();
-            contextManager.dispose();
-            applyManager.dispose();
-            wsServer.dispose();
-            taskRunner.dispose();
+            try { cfgSub.dispose(); } catch { /* ignore */ }
+            try { indexSub.dispose(); } catch { /* ignore */ }
+            try { projectMemory.dispose(); } catch { /* ignore */ }
+            try { stateManager.dispose(); } catch { /* ignore */ }
+            try { planManager.dispose(); } catch { /* ignore */ }
+            try { indexer.dispose(); } catch { /* ignore */ }
+            try { contextManager.dispose(); } catch { /* ignore */ }
+            try { applyManager.dispose(); } catch { /* ignore */ }
+            try { wsServer.dispose(); } catch { /* ignore */ }
+            try { taskRunner.dispose(); } catch { /* ignore */ }
         }
     });
 }

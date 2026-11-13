@@ -23,6 +23,10 @@
       {
         "command": "deepseekContextSync.diagnose",
         "title": "DeepSeek Context Sync: Diagnóstico"
+      },
+      {
+        "command": "deepseekContextSync.decompileDllToProject",
+        "title": "DeepSeek Context Sync: Decompilar DLL .NET para projeto C# (editável)"
       }
     ],
     "configuration": {
@@ -158,8 +162,27 @@
           "type": "boolean",
           "default": true,
           "description": "Extrai imports/exports/seções, metadados .NET (tipos/métodos/literais) e strings legíveis de binários PE (.dll, .exe, .sys, .ocx, ...) e inclui o resumo em texto no contexto enviado ao chat. NUNCA envia bytes crus. Desligue para ignorar binários por completo. Reabra o workspace para que arquivos já carregados em memória sejam reavaliados."
+        },
+        "deepseekContextSync.reEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Permite que a IA do chat peça engenharia reversa de binários do workspace (### RE:): listar funções, decompilar, desmontar, xrefs, strings e patch de bytes. Patches sempre pedem sua aprovação."
+        },
+        "deepseekContextSync.ghidraPath": {
+          "type": "string",
+          "default": "",
+          "description": "Pasta do Ghidra (a que contém support/analyzeHeadless). Instale o JDK exigido pela versão do Ghidra utilizada. Vazio = variável de ambiente GHIDRA_HOME. Necessário só para DLL/EXE nativo; .NET usa o ILSpy."
         }
       }
+    },
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "deepseekContextSync.decompileDllToProject",
+          "when": "resourceExtname == .dll || resourceExtname == .exe",
+          "group": "navigation@100"
+        }
+      ]
     }
   },
   "scripts": {
@@ -167,7 +190,7 @@
     "watch": "tsc -watch -p ./",
     "build": "tsc -p ./",
     "test:graph": "npm run compile && node test/graph.smoke.js",
-    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js test/agentRegistry.test.js test/reviewManager.test.js test/finalAuditor.test.js test/missionController.test.js test/peInspector.test.js test/decompiler.test.js test/integration/fullWorkflow.test.js test/integration/multiagentWorkflow.test.js"
+    "test": "npm run compile && node --test test/parser.test.js test/applyPlan.test.js test/pathValidator.test.js test/messageValidator.test.js test/applyTransaction.test.js test/agentPlan.test.js test/iterationGuard.test.js test/resultEvaluator.test.js test/recoveryManager.test.js test/dependencyAnalyzer.test.js test/impactAnalyzer.test.js test/contextBudget.test.js test/semanticSearch.test.js test/agentRegistry.test.js test/reviewManager.test.js test/finalAuditor.test.js test/missionController.test.js test/peInspector.test.js test/decompiler.test.js test/reBridge.test.js test/integration/fullWorkflow.test.js test/integration/multiagentWorkflow.test.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

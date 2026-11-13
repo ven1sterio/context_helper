@@ -102,7 +102,7 @@
 
     /** O Quill põe <p><br></p> quando vazio; normaliza para string vazia. */
     function normalizeEditorText(s) {
-        return (s || '').replace(/​/g, '').replace(/\r\n/g, '\n');
+        return (s || '').replace(/\u200B/g, '').replace(/\r\n/g, '\n');
     }
 
     class GeminiProvider {
@@ -137,6 +137,14 @@
             return normalizeEditorText(input.innerText || input.textContent || '');
         }
 
+        /**
+         * Cola texto no editor. IMPORTANTE: NÃO verificar `got()` logo depois
+         * do paste — o Quill (Angular) processa o evento de forma assíncrona,
+         * então o check imediato daria falso negativo e o `insertText` de
+         * fallback DUPLICARIA o conteúdo. Aqui fazemos UMA ÚNICA estratégia:
+         * paste sintético. Se ele falhar, quem chama usa `setInputChunked`
+         * (com `await` entre chunks) para re-tentar.
+         */
         setInput(input, text) {
             if (!input) return;
             if (input.tagName === 'TEXTAREA') {
@@ -148,44 +156,14 @@
             }
 
             input.focus();
-            // Limpa o conteúdo atual.
             try { document.execCommand('selectAll', false, null); } catch { /* ignore */ }
             try { document.execCommand('delete', false, null); } catch { /* ignore */ }
 
-            // 1) Paste sintético (rápido, aceita textos grandes).
-            let pasted = false;
             try {
                 const dt = new DataTransfer();
                 dt.setData('text/plain', text);
-                const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
-                input.dispatchEvent(ev);
-                pasted = true;
-            } catch { pasted = false; }
-
-            // 2) Confere se entrou; senão tenta insertText.
-            const expected = text.replace(/\s+/g, '').length;
-            // textContent não força layout; innerText em 100s de KB trava a aba.
-            const got = () => (input.textContent || '').replace(/\s+/g, '').length;
-            if (!pasted || got() < expected * 0.9) {
-                try {
-                    document.execCommand('selectAll', false, null);
-                    document.execCommand('insertText', false, text);
-                } catch { /* ignore */ }
-            }
-
-            // 3) Último recurso: monta parágrafos e dispara `input`.
-            if (got() < expected * 0.9) {
-                input.textContent = '';
-                const frag = document.createDocumentFragment();
-                for (const line of text.split('\n')) {
-                    const p = document.createElement('p');
-                    if (line.length === 0) p.appendChild(document.createElement('br'));
-                    else p.textContent = line;
-                    frag.appendChild(p);
-                }
-                input.appendChild(frag);
-                input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' }));
-            }
+                input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+            } catch { /* ignore */ }
 
             try { input.scrollTop = input.scrollHeight; } catch { /* ignore */ }
         }
@@ -284,7 +262,6 @@
             input.focus();
             await sleep(150);
 
-            // Após colar texto grande (ou anexar arquivo) o botão demora para habilitar.
             const tries = Math.max(40, Math.ceil((waitMs || 6000) / 150));
             let btn = null;
             for (let i = 0; i < tries; i++) {
@@ -297,14 +274,12 @@
             if (btn) {
                 btn.click();
             } else {
-                // Fallback: Enter (no Gemini, Enter envia; Shift+Enter quebra linha).
                 input.dispatchEvent(new KeyboardEvent('keydown', {
                     key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
                     bubbles: true, cancelable: true
                 }));
             }
 
-            // Sucesso = campo esvaziou OU a geração começou (botão virou "parar").
             for (let i = 0; i < 40; i++) {
                 await sleep(150);
                 if (this.isInputEmpty(input)) return true;
