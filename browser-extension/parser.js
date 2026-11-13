@@ -9,9 +9,12 @@ const MOVE_MARKER_RE = /^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:MOVE|RENAME)\s*:\s*(.+?)\s
 const REPLACE_LINES_MARKER_RE = /^\s*(?:#{1,6}\s*)?(?:\*\*)?REPLACE_LINES\s*:\s*(.+?)\s*$/i;
 
 // Marcadores de bloco SEARCH/REPLACE (tolerantes: 5+ sinais, REPLACE solto no fim, etc.).
-const EDIT_START_RE = /^[ \t]*<{5,}[ \t]*(?:SEARCH\b.*)?$/i;
-const EDIT_SEP_RE = /^[ \t]*={5,}[ \t]*$/;
-const EDIT_END_RE = /^[ \t]*(?:>{5,}[ \t]*(?:REPLACE\b.*)?|REPLACE[ \t]*)$/i;
+// Formato novo (imune ao markdown): [[SEARCH]] ... [[REPLACE]] ... [[END]].
+// Motivo: a linha "=======" fora de cerca vira título (setext) no chat e SOME do texto lido.
+const EDIT_START_RE = /^[ \t]*(?:<{5,}[ \t]*(?:SEARCH\b.*)?|\[\[[ \t]*SEARCH[ \t]*\]\])[ \t]*$/i;
+const EDIT_SEP_RE = /^[ \t]*(?:={5,}|\[\[[ \t]*REPLACE[ \t]*\]\])[ \t]*$/i;
+const EDIT_END_RE = /^[ \t]*(?:>{5,}[ \t]*(?:REPLACE\b.*)?|REPLACE[ \t]*|\[\[[ \t]*(?:END|\/REPLACE)[ \t]*\]\])$/i;
+const EDIT_START_ANY_RE = /^[ \t]*(?:<{5,}|\[\[[ \t]*SEARCH[ \t]*\]\])/im;
 const FENCE_ONLY_RE = /^[ \t]*(?:`{3,}|~{3,})[\w+#.-]*[ \t]*$/;
 
 const ELLIPSIS_LINE_RE = /^\s*(?:(?:\/\/|#|\/\*+|<!--|--|;)\s*)?(?:\.{3}|…)\s*(?:\*+\/|-->)?\s*$/m;
@@ -194,7 +197,7 @@ function scanEdits(text, opts) {
             search.push(lines[i]); i++;
         }
         if (!sep) {
-            warnings.push(`bloco ${n}${where}: faltou a linha "=======" entre o SEARCH e o REPLACE.`);
+            warnings.push(`bloco ${n}${where}: faltou o separador entre o SEARCH e o REPLACE ("[[REPLACE]]" ou "======="). Se o texto veio fora de cerca de código, o chat apaga a linha "======="; peça o bloco dentro da cerca, no formato [[SEARCH]]/[[REPLACE]]/[[END]].`);
             continue;
         }
 
@@ -224,7 +227,7 @@ function scanEdits(text, opts) {
 }
 
 function hasEditStart(text) {
-    return /^[ \t]*<{5,}/m.test(text);
+    return EDIT_START_ANY_RE.test(text);
 }
 
 function parseItemsFromContainer(container, warnings) {
@@ -258,7 +261,7 @@ function parseItemsFromContainer(container, warnings) {
                 pendingFilePath = null;
                 lastEditPath = null;
             } else if (pendingFilePath) {
-                if (/^[ \t]*<{5,}[ \t]*(?:SEARCH\b.*)?$/im.test(raw)) {
+                if (EDIT_START_RE.test(raw.split('\n').find(l => l.trim() !== '') || '') || hasEditStart(raw)) {
                     const blocks = scanEdits(raw, { path: pendingFilePath, warnings });
                     for (const b of blocks) results.push(b);
                 } else {
@@ -327,7 +330,7 @@ function parseItemsFromText(text, warnings) {
     );
     while ((m = fileRegex.exec(text)) !== null) {
         const p = cleanPath(m[1]);
-        if (/^[ \t]*<{5,}/m.test(m[2])) continue;
+        if (hasEditStart(m[2])) continue;
         if (isPlausiblePath(p)) results.push({ filePath: p, content: normalizeContent(m[2]) });
     }
     for (const b of scanEdits(text, { detectMarkers: true, warnings })) results.push(b);
@@ -380,7 +383,8 @@ function findViolations(item) {
 function parseLastResponse() {
     const container = findLastAssistantMessage();
     if (!container) {
-        return { error: 'Não encontrei a última resposta na página (o site pode ter mudado; ajuste ASSISTANT_SELECTORS em providers/deepseek.js ou providers/gemini.js).' };
+        const site = (typeof window !== 'undefined' && window.DSProviderName) || 'o site';
+        return { error: `Não encontrei a última resposta na página do ${site} (o site pode ter mudado; ajuste ASSISTANT_SELECTORS em providers/*.js).` };
     }
 
     const warnings = [];
@@ -417,7 +421,10 @@ function parseLastResponse() {
         }
     }
     if (found.length === 0 && warnings.length === 0) {
-        return { error: 'Nenhum bloco "### FILE:", "EDIT:", "### DELETE:", "### MOVE:" ou "### REPLACE_LINES:" encontrado na última resposta.' };
+        const peek = fullText.replace(/\s+/g, ' ').trim();
+        return { error: 'Nenhum bloco "### FILE:", "EDIT:", "### DELETE:", "### MOVE:" ou "### REPLACE_LINES:" encontrado na última resposta '
+            + `(li ${fullText.length} caracteres; começa com: "${peek.slice(0, 80)}"; termina com: "${peek.slice(-60)}"). `
+            + 'Se isso não parece a resposta do modelo, o seletor da página pegou o nó errado (raciocínio/bloco antigo).' };
     }
 
     const byPath = new Map();
