@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { ContextManager } from './contextManager';
+import { ContextManager, DecompileProgressSnapshot } from './contextManager';
 import { ApplyManager } from './applyManager';
 import { WsServer } from './wsServer';
 import { TaskRunner } from './taskRunner';
@@ -98,6 +98,60 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         );
         return;
     }
+
+    // --- Status bar: progresso da decompilação (ILSpy / Ghidra) ---
+    const decompileStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+    decompileStatus.command = 'deepseekContextSync.showDecompileProgress';
+    decompileStatus.hide();
+    context.subscriptions.push(decompileStatus);
+
+    const decompileChannel = vscode.window.createOutputChannel('DeepSeek Decompilação');
+    context.subscriptions.push(decompileChannel);
+
+    const updateDecompileStatus = (snap: DecompileProgressSnapshot) => {
+        if (snap.isWorking) {
+            decompileStatus.text = `$(sync~spin) 🔬 Decompilando ${snap.running}/${snap.total}` +
+                (snap.queued > 0 ? ` (fila: ${snap.queued})` : '');
+            decompileStatus.tooltip = 'Clique para ver os detalhes da decompilação';
+            decompileStatus.show();
+        } else if (snap.failed > 0) {
+            decompileStatus.text = `$(warning) 🔬 ${snap.done}/${snap.total} (${snap.failed} falhou)`;
+            decompileStatus.tooltip = 'Clique para ver os detalhes da decompilação';
+            decompileStatus.show();
+        } else {
+            decompileStatus.hide();
+        }
+    };
+
+    context.subscriptions.push(contextManager.onDecompileProgress(updateDecompileStatus));
+    updateDecompileStatus(contextManager.getDecompileProgress());
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('deepseekContextSync.showDecompileProgress', () => {
+            const snap = contextManager.getDecompileProgress();
+            decompileChannel.clear();
+            decompileChannel.appendLine(`# Decompilação — ${new Date().toLocaleString()}`);
+            decompileChannel.appendLine('');
+            decompileChannel.appendLine(
+                `Total: ${snap.total} | Queued: ${snap.queued} | Running: ${snap.running} | ` +
+                `Done: ${snap.done} | Failed: ${snap.failed} | Skipped: ${snap.skipped}`
+            );
+            decompileChannel.appendLine('');
+            if (snap.jobs.length === 0) {
+                decompileChannel.appendLine('(nenhuma decompilação registrada nesta sessão)');
+            } else {
+                for (const j of snap.jobs) {
+                    const dur = j.startedAt && j.endedAt
+                        ? ` (${((new Date(j.endedAt).getTime() - new Date(j.startedAt).getTime()) / 1000).toFixed(1)}s)`
+                        : '';
+                    decompileChannel.appendLine(`[${j.status}] ${j.kind} ${j.rel}${dur}`);
+                    if (j.truncated) decompileChannel.appendLine('       ✂️ código truncado no limite de KB');
+                    if (j.error) decompileChannel.appendLine(`       ⚠️ ${j.error}`);
+                }
+            }
+            decompileChannel.show(true);
+        })
+    );
 
     const indexer = new Indexer(workspaceRoot);
     try {

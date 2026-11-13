@@ -161,6 +161,8 @@
                 this._notify('multiAgentState', msg);
             } else if (t === 'sessionRegistered') {
                 this._notify('sessionRegistered', msg);
+            } else if (t === 'decompileProgress') {
+                this._notify('decompileProgress', msg);
             }
         }
 

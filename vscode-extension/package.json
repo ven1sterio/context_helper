@@ -27,6 +27,10 @@
       {
         "command": "deepseekContextSync.decompileDllToProject",
         "title": "DeepSeek Context Sync: Decompilar DLL .NET para projeto C# (editável)"
+      },
+      {
+        "command": "deepseekContextSync.showDecompileProgress",
+        "title": "DeepSeek Context Sync: Ver Progresso de Decompilação"
       }
     ],
     "configuration": {

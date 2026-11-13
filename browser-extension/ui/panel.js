@@ -87,6 +87,7 @@
             this.selectReview = false;
             this.selectionState = null;
             this._toastTimer = null;
+            this._decompileProgress = null;
             this._els = {};
             this._build();
             state.subscribe(s => this.update(s));
@@ -276,6 +277,11 @@
 
         refresh() { this.update({ state: state.state, connected: state.connected }); }
 
+        showDecompileProgress(snap) {
+            this._decompileProgress = snap || null;
+            this.update(state && { state: state.state, connected: state.connected });
+        }
+
         update(s) {
             if (!this._els.fab) return;
             const st = s.state;
@@ -292,12 +298,19 @@
 
             this._els.statusRow.classList.toggle('ds-connected', connected);
             this._els.statusRow.classList.toggle('ds-running', busy);
-            this._els.statusLabel.textContent = !connected
+            let statusText = !connected
                 ? (window.DS.connection.authToken ? 'Desconectado' : 'Token não configurado')
                 : paused ? `Pausado · iter. ${s.iteration}`
                 : running ? `Rodando · iter. ${s.iteration}`
                 : applying ? `Aplicando · iter. ${s.iteration}`
                 : 'Conectado ao VS Code';
+            const dp = this._decompileProgress;
+            if (dp && dp.isWorking) {
+                statusText += ` · 🔬 ${dp.running}/${dp.total}`;
+            } else if (dp && dp.failed > 0 && dp.total > 0) {
+                statusText += ` · 🔬 ${dp.done}/${dp.total} (${dp.failed} falhou)`;
+            }
+            this._els.statusLabel.textContent = statusText;
 
             this._els.fullCodeToggle.classList.toggle('ds-warning', this.fullCodeMode);
             this._els.fullCodeToggle.classList.toggle('ds-ghost', !this.fullCodeMode);

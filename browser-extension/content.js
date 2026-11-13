@@ -102,6 +102,9 @@
             panel.toast('🔑 Token não configurado. Clique em "🔑 Token" no painel.');
         });
         conn.on('config', () => panel.refresh());
+        conn.on('decompileProgress', (msg) => {
+            panel.showDecompileProgress(msg);
+        });
         conn.on('applyResult', (msg) => {
             const icon = msg.status === 'applied' ? '✅' : msg.status === 'cancelled' ? '⏹' : '❌';
             panel.toast(`${icon} ${msg.message || msg.status}`);

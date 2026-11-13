@@ -45,6 +45,9 @@ export class ContextManager {
     private ilspyWarned = false;
     private ghidraWarned = false;
     private pendingDecompiles = new Set<string>();
+    private decompileJobs = new Map<string, DecompileJob>();
+    private readonly _onDecompileProgress = new vscode.EventEmitter<DecompileProgressSnapshot>();
+    readonly onDecompileProgress = this._onDecompileProgress.event;
     private reCacheDir: string | undefined;
     private allPaths = new Set<string>();
     private disposables: vscode.Disposable[] = [];
@@ -96,6 +99,37 @@ export class ContextManager {
         while (this.pendingDecompiles.size > 0 && Date.now() - start < timeoutMs) {
             await new Promise<void>(r => setTimeout(r, 500));
         }
+    }
+
+    /** Snapshot do progresso atual — usado pela status bar e pelo WS. */
+    getDecompileProgress(): DecompileProgressSnapshot {
+        const jobs = [...this.decompileJobs.values()];
+        let queued = 0, running = 0, done = 0, failed = 0, skipped = 0;
+        for (const j of jobs) {
+            if (j.status === 'queued') queued++;
+            else if (j.status === 'running') running++;
+            else if (j.status === 'done') done++;
+            else if (j.status === 'failed') failed++;
+            else if (j.status === 'skipped') skipped++;
+        }
+        return {
+            jobs,
+            queued, running, done, failed, skipped,
+            total: jobs.length,
+            isWorking: queued + running > 0
+        };
+    }
+
+    private emitDecompileProgress(): void {
+        try { this._onDecompileProgress.fire(this.getDecompileProgress()); } catch { /* ignore */ }
+    }
+
+    private setDecompileJob(rel: string, status: DecompileStatus, patch: Partial<DecompileJob> = {}): void {
+        const j = this.decompileJobs.get(rel);
+        if (!j) return;
+        j.status = status;
+        Object.assign(j, patch);
+        this.emitDecompileProgress();
     }
 
     private get autoDecompileNativeEnabled(): boolean {
@@ -210,12 +244,27 @@ export class ContextManager {
 
     private scheduleDecompile(rel: string, fsPath: string, hash: string, summary: string) {
         const cfg = this.decompileSettings;
-        if (this.decompileCount >= cfg.maxAssemblies) return;
+        if (this.decompileCount >= cfg.maxAssemblies) {
+            this.decompileJobs.set(rel, {
+                rel, kind: 'dotnet', status: 'skipped',
+                queuedAt: new Date().toISOString(),
+                endedAt: new Date().toISOString(),
+                error: `limite de assemblies por sessão (${cfg.maxAssemblies}) atingido`
+            });
+            this.emitDecompileProgress();
+            return;
+        }
         this.decompileCount++;
 
+        this.decompileJobs.set(rel, {
+            rel, kind: 'dotnet', status: 'queued',
+            queuedAt: new Date().toISOString()
+        });
+        this.emitDecompileProgress();
         this.pendingDecompiles.add(rel);
 
         void this.decompileLimiter.run(async () => {
+            this.setDecompileJob(rel, 'running', { startedAt: new Date().toISOString() });
             try {
                 const res = await decompileAssembly(fsPath, {
                     exePath: cfg.exePath,
@@ -231,16 +280,35 @@ export class ContextManager {
                             'Instale com: dotnet tool install --global ilspycmd (ou ajuste "deepseekContextSync.ilspyPath").'
                         );
                     }
+                    this.setDecompileJob(rel, 'failed', {
+                        endedAt: new Date().toISOString(),
+                        error: res.reason + (res.detail ? ': ' + res.detail : '')
+                    });
                     return;
                 }
 
-                if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) return;
+                if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) {
+                    this.setDecompileJob(rel, 'skipped', {
+                        endedAt: new Date().toISOString(),
+                        error: 'arquivo mudou durante a decompilação'
+                    });
+                    return;
+                }
 
                 const note = res.truncated ? '\n// [código truncado pelo limite "maxDecompiledKB"]' : '';
                 const block = `\n\nCódigo C# descompilado (ILSpy):\n${res.code}${note}`;
                 this.decompileCache.set(rel, { hash, block });
                 this.binaries.set(rel, summary + block);
+                this.setDecompileJob(rel, 'done', {
+                    endedAt: new Date().toISOString(),
+                    truncated: res.truncated
+                });
                 this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+            } catch (e) {
+                this.setDecompileJob(rel, 'failed', {
+                    endedAt: new Date().toISOString(),
+                    error: e instanceof Error ? e.message : String(e)
+                });
             } finally {
                 this.pendingDecompiles.delete(rel);
             }
@@ -259,14 +327,36 @@ export class ContextManager {
                     'Sem ele, só os metadados (imports/exports/strings) entram no contexto.'
                 );
             }
+            this.decompileJobs.set(rel, {
+                rel, kind: 'ghidra', status: 'skipped',
+                queuedAt: new Date().toISOString(),
+                endedAt: new Date().toISOString(),
+                error: 'Ghidra não configurado (ghidraPath / GHIDRA_HOME)'
+            });
+            this.emitDecompileProgress();
             return;
         }
 
         const settings = this.decompileSettings;
-        if (this.decompileCount >= settings.maxAssemblies) return;
+        if (this.decompileCount >= settings.maxAssemblies) {
+            this.decompileJobs.set(rel, {
+                rel, kind: 'ghidra', status: 'skipped',
+                queuedAt: new Date().toISOString(),
+                endedAt: new Date().toISOString(),
+                error: `limite de assemblies por sessão (${settings.maxAssemblies}) atingido`
+            });
+            this.emitDecompileProgress();
+            return;
+        }
         this.decompileCount++;
 
+        this.decompileJobs.set(rel, {
+            rel, kind: 'ghidra', status: 'queued',
+            queuedAt: new Date().toISOString()
+        });
+        this.emitDecompileProgress();
         this.pendingDecompiles.add(rel);
+
         if (!this.ghidraWarned) {
             this.ghidraWarned = true;
             void vscode.window.showInformationMessage(
@@ -276,6 +366,7 @@ export class ContextManager {
         }
 
         void this.decompileLimiter.run(async () => {
+            this.setDecompileJob(rel, 'running', { startedAt: new Date().toISOString() });
             try {
                 const res = await decompileNativeAll(rel, {
                     workspaceRoot: this.workspaceRoot,
@@ -290,17 +381,32 @@ export class ContextManager {
 
                 if (!res.ok) {
                     console.warn('[DeepSeek Context Sync] Ghidra falhou em', rel, ':', res.text.slice(0, 300));
+                    this.setDecompileJob(rel, 'failed', {
+                        endedAt: new Date().toISOString(),
+                        error: res.text.slice(0, 500)
+                    });
                     return;
                 }
 
-                if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) return;
+                if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) {
+                    this.setDecompileJob(rel, 'skipped', {
+                        endedAt: new Date().toISOString(),
+                        error: 'arquivo mudou durante a decompilação'
+                    });
+                    return;
+                }
 
                 const block = `\n\nCódigo decompilado (Ghidra):\n${res.text}`;
                 this.decompileCache.set(rel, { hash, block });
                 this.binaries.set(rel, summary + block);
+                this.setDecompileJob(rel, 'done', { endedAt: new Date().toISOString() });
                 this._onDidChange.fire({ relPath: rel, kind: 'changed' });
             } catch (e) {
                 console.warn('[DeepSeek Context Sync] Ghidra exception em', rel, ':', e);
+                this.setDecompileJob(rel, 'failed', {
+                    endedAt: new Date().toISOString(),
+                    error: e instanceof Error ? e.message : String(e)
+                });
             } finally {
                 this.pendingDecompiles.delete(rel);
             }
@@ -331,6 +437,7 @@ export class ContextManager {
         this.decompileCache.delete(rel);
         this.binaryHash.delete(rel);
         this.pendingDecompiles.delete(rel);
+        if (this.decompileJobs.delete(rel)) this.emitDecompileProgress();
         this.removePath(rel, true);
         const prefix = rel + '/';
         for (const key of [...this.files.keys()]) {
@@ -345,6 +452,11 @@ export class ContextManager {
         }
         for (const key of [...this.pendingDecompiles]) {
             if (key.startsWith(prefix)) this.pendingDecompiles.delete(key);
+        }
+        for (const key of [...this.decompileJobs.keys()]) {
+            if (key.startsWith(prefix)) {
+                if (this.decompileJobs.delete(key)) this.emitDecompileProgress();
+            }
         }
         for (const key of [...this.allPaths]) {
             if (key.startsWith(prefix)) this.removePath(key, true);
@@ -499,5 +611,6 @@ export class ContextManager {
 
     dispose() {
         this.disposables.forEach(d => d.dispose());
+        try { this._onDecompileProgress.dispose(); } catch { /* ignore */ }
     }
 }

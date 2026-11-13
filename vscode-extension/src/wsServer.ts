@@ -118,7 +118,10 @@ export class WsServer {
 
             const subs = [
                 this.contextManager.onDidChange(e => { pending.set(e.relPath, e.kind); }),
-                this.contextManager.onDidChangeTree(() => { treeDirty = true; })
+                this.contextManager.onDidChangeTree(() => { treeDirty = true; }),
+                this.contextManager.onDecompileProgress(snap => {
+                    send({ type: 'decompileProgress', ...snap });
+                })
             ];
 
             const send = (payload: object) => {
@@ -166,6 +169,7 @@ export class WsServer {
                 token: this.token,
                 onAuthenticated: () => {
                     send({ type: 'config', timeouts: timeoutsPayload() });
+                    send({ type: 'decompileProgress', ...this.contextManager.getDecompileProgress() });
                 },
                 onRejected: (reason) => {
                     send({ type: 'error', message: `Autenticação falhou: ${reason}` });
