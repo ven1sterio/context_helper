@@ -198,8 +198,14 @@
                 await sleep(40);
             }
             const expected = text.replace(/\s+/g, '').length;
-            const got = (input.textContent || '').replace(/\s+/g, '').length;
-            return got >= expected * 0.9;
+            const readGot = () => (input.textContent || input.value || '').replace(/\s+/g, '').length;
+            // O editor processa o paste de forma assíncrona: conferir logo após o último
+            // pedaço dava falso "só parte do texto". Espera até ~3s antes de concluir.
+            for (let i = 0; i < 20; i++) {
+                if (readGot() >= expected * 0.9) return true;
+                await sleep(150);
+            }
+            return false;
         }
 
         /** Há um chip de anexo mostrando esse nome de arquivo? */
