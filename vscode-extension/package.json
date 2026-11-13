@@ -54,31 +54,15 @@
         },
         "deepseekContextSync.responseTimeout": {
           "type": "number",
-          "enum": [
-            60,
-            300,
-            600
-          ],
-          "enumDescriptions": [
-            "1 minuto",
-            "5 minutos",
-            "10 minutos"
-          ],
+          "enum": [60, 300, 600],
+          "enumDescriptions": ["1 minuto", "5 minutos", "10 minutos"],
           "default": 600,
           "description": "Tempo máximo aguardando a resposta do chat (DeepSeek ou Gemini)."
         },
         "deepseekContextSync.runTimeout": {
           "type": "number",
-          "enum": [
-            60,
-            300,
-            600
-          ],
-          "enumDescriptions": [
-            "1 minuto",
-            "5 minutos",
-            "10 minutos"
-          ],
+          "enum": [60, 300, 600],
+          "enumDescriptions": ["1 minuto", "5 minutos", "10 minutos"],
           "default": 600,
           "description": "Tempo máximo de um comando de build/teste no Full Code."
         },
@@ -104,10 +88,7 @@
         },
         "deepseekContextSync.applyMode": {
           "type": "string",
-          "enum": [
-            "partial",
-            "atomic"
-          ],
+          "enum": ["partial", "atomic"],
           "enumDescriptions": [
             "Aplica as edições que casam e lista as que não casaram (pede confirmação)",
             "Qualquer edição que não case rejeita tudo"
@@ -117,14 +98,8 @@
         },
         "deepseekContextSync.useGraph": {
           "type": "string",
-          "enum": [
-            "auto",
-            "off"
-          ],
-          "enumDescriptions": [
-            "Usa o grafo se existir",
-            "Ignora o grafo"
-          ],
+          "enum": ["auto", "off"],
+          "enumDescriptions": ["Usa o grafo se existir", "Ignora o grafo"],
           "default": "auto",
           "description": "Usar o graph.json do graphify para escolher arquivos no modo seletivo."
         },
@@ -142,6 +117,11 @@
           "type": "boolean",
           "default": true,
           "description": "Decompila DLLs/EXEs .NET com o ILSpy (ilspycmd) e envia o C# no contexto. Requer: dotnet tool install --global ilspycmd. Sem a ferramenta instalada, cai para o resumo de nomes/strings."
+        },
+        "deepseekContextSync.autoDecompileNative": {
+          "type": "boolean",
+          "default": true,
+          "description": "Decompila DLLs/EXEs NATIVAS (C/C++) com o Ghidra automaticamente ao carregar o workspace e inclui o pseudo-C no contexto enviado ao chat. A 1ª análise de cada binário pode levar dezenas de minutos; depois fica em cache. Requer Ghidra configurado (ghidraPath ou GHIDRA_HOME). Desligue para enviar só os metadados (imports/exports/strings)."
         },
         "deepseekContextSync.ilspyPath": {
           "type": "string",

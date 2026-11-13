@@ -65,6 +65,7 @@ public class ReBridge extends GhidraScript {
             else if (op.equals("xrefs")) xrefs();
             else if (op.equals("strings")) strings();
             else if (op.equals("asm")) asm();
+            else if (op.equals("decompile-all")) decompileAll();
             else error("operação desconhecida: " + op);
 
         } catch (Exception e) {
@@ -92,7 +93,6 @@ public class ReBridge extends GhidraScript {
         return currentProgram.getAddressFactory().getAddress(t.toLowerCase().startsWith("0x") ? t.substring(2) : t);
     }
 
-    /** Função por endereço, nome exato ou nome parcial. Se ambíguo, lista candidatos e retorna null. */
     private Function findFunction(String t) {
         if (looksLikeAddress(t)) {
             Address ad = addr(t);
@@ -236,6 +236,44 @@ public class ReBridge extends GhidraScript {
             }
         }
         out.append("-- ").append(found).append(" string(s)").append(found == 30 ? " (limite)" : "").append("\n");
+    }
+
+    private void decompileAll() throws Exception {
+        String f = q.getOrDefault("filter", "").toLowerCase();
+        int limit = Math.max(1, Math.min(num("limit", 40), 200));
+        int maxChars = Math.max(5000, Math.min(num("max_chars", 200_000), 5_000_000));
+        DecompInterface di = new DecompInterface();
+        try {
+            di.openProgram(currentProgram);
+            int shown = 0, total = 0, chars = 0;
+            StringBuilder b = new StringBuilder();
+            FunctionIterator it = currentProgram.getFunctionManager().getFunctions(true);
+            while (it.hasNext() && shown < limit) {
+                Function fn = it.next();
+                if (fn.isExternal() || fn.isThunk()) continue;
+                String n = fn.getName(true);
+                if (!f.isEmpty() && !n.toLowerCase().contains(f)) continue;
+                total++;
+                if (chars + 4000 > maxChars) {
+                    b.append("\n// [limite de caracteres atingido; use RE: decompile para funções específicas]\n");
+                    break;
+                }
+                DecompileResults r;
+                try { r = di.decompileFunction(fn, 30, monitor); } catch (Exception e) { continue; }
+                if (r == null || !r.decompileCompleted()) continue;
+                String c = r.getDecompiledFunction().getC();
+                if (c == null || c.isEmpty()) continue;
+                if (c.length() > 8000) c = c.substring(0, 8000) + "\n// ... [função truncada; use RE: decompile target=" + fn.getEntryPoint() + "]\n";
+                b.append("// === ").append(n).append(" @ ").append(fn.getEntryPoint()).append(" ===\n");
+                b.append(c).append("\n\n");
+                chars += c.length() + 100;
+                shown++;
+            }
+            out.append("-- ").append(shown).append(" de ").append(total).append(" função(ões) decompiladas\n\n");
+            out.append(b);
+        } finally {
+            di.dispose();
+        }
     }
 
     private void asm() throws Exception {

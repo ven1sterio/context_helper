@@ -46,7 +46,6 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 async function activateInternal(context: vscode.ExtensionContext) {
-    // Timer de diagnóstico: se algum `await` travar, avisa o usuário.
     let timedOut = false;
     const timer = setTimeout(() => {
         timedOut = true;
@@ -84,8 +83,10 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         await context.globalState.update(TOKEN_KEY, token);
     }
 
-    // ---------- ContextManager ----------
     const contextManager = new ContextManager(workspaceRoot);
+    try {
+        contextManager.setReCacheDir(path.join(context.globalStorageUri.fsPath, 're'));
+    } catch { /* ignore */ }
     try {
         console.log(LOG, 'inicializando ContextManager...');
         await contextManager.initialize();
@@ -98,7 +99,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         return;
     }
 
-    // ---------- Indexer ----------
     const indexer = new Indexer(workspaceRoot);
     try {
         console.log(LOG, 'inicializando Indexer...');
@@ -111,7 +111,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         );
     }
 
-    // ---------- StateManager ----------
     const stateManager = new StateManager(workspaceRoot);
     try {
         await stateManager.initialize();
@@ -119,7 +118,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         console.warn(LOG, 'StateManager falhou:', e);
     }
 
-    // ---------- ProjectMemory ----------
     const projectMemory = new ProjectMemory(workspaceRoot);
     try {
         await projectMemory.load();
@@ -128,14 +126,12 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         console.warn(LOG, 'ProjectMemory falhou:', e);
     }
 
-    // ---------- Apply + TaskRunner ----------
     const applyManager = new ApplyManager(workspaceRoot, {
         findDependents: (rel) => indexer.getDependentsOf(rel),
         allFilePaths: () => new Set(Object.keys(indexer.getIndex().files))
     });
     const taskRunner = new TaskRunner(workspaceRoot);
 
-    // ---------- WsServer ----------
     console.log(LOG, 'inicializando WsServer em 127.0.0.1:8765...');
     let wsServer: WsServer;
     try {
@@ -190,7 +186,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         }
         return handleReRequests(requests, {
             workspaceRoot,
-            // globalStorage não tem segmento iniciado por ponto (o Ghidra recusa ".algo" no caminho do projeto).
             cacheDir: path.join(context.globalStorageUri.fsPath, 're'),
             ghidraHome: cfg.get<string>('ghidraPath', '') || process.env.GHIDRA_HOME,
             ilspyPath: cfg.get<string>('ilspyPath', 'ilspycmd'),
@@ -200,7 +195,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         });
     });
 
-    // ---------- Full Code 2.0 ----------
     const planManager = new PlanManager(workspaceRoot);
     const taskQueue = new TaskQueue(planManager);
     const runHistory = new RunHistory(workspaceRoot);
@@ -214,7 +208,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         recovery: recoveryManager
     });
 
-    // ---------- Multiagente ----------
     const agentRegistry = new AgentRegistry();
     const deliverables = new DeliverableManager();
     const reviews = new ReviewManager();
@@ -234,7 +227,6 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
         dispatcher
     });
 
-    // Recovery
     try {
         const recovery = await recoveryManager.inspect();
         if (recovery.kind === 'running') {

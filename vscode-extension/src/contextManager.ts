@@ -5,6 +5,7 @@ import { ContextBudget } from './intelligence/contextBudget';
 import { IndexData } from './indexer';
 import { parsePE, formatPEInfo } from './peInspector';
 import { decompileAssembly, isFrameworkAssembly, Limiter } from './decompiler';
+import { decompileNativeAll } from './reBridge';
 
 export type ChangeKind = 'changed' | 'deleted';
 
@@ -36,17 +37,15 @@ interface TreeNode {
 
 export class ContextManager {
     private files = new Map<string, string>();
-    // Binários (.dll/.exe/...) cujo conteúdo foi resumido em texto pelo
-    // peInspector. Ficam separados de `files` porque não são texto puro —
-    // o resumo é anexado ao contexto em buildFull/buildFullWithBudget/buildDelta.
     private binaries = new Map<string, string>();
-    // Cache do C# descompilado (ILSpy) por arquivo, validado pelo hash do binário.
     private decompileCache = new Map<string, { hash: string; block: string }>();
-    // Hash da versão do binário cujo resumo está em `binaries` (descarta resultado atrasado).
     private binaryHash = new Map<string, string>();
     private decompileLimiter = new Limiter(2);
     private decompileCount = 0;
     private ilspyWarned = false;
+    private ghidraWarned = false;
+    private pendingDecompiles = new Set<string>();
+    private reCacheDir: string | undefined;
     private allPaths = new Set<string>();
     private disposables: vscode.Disposable[] = [];
 
@@ -62,7 +61,6 @@ export class ContextManager {
         return kb * 1024;
     }
 
-    /** Teto de leitura para binários inspecionáveis (.dll/.exe/...). O conteúdo bruto nunca é enviado. */
     private get maxBinaryBytes(): number {
         const mb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxBinaryMB', 50);
         return mb * 1024 * 1024;
@@ -87,6 +85,23 @@ export class ContextManager {
 
     getAllBinaries(): ReadonlyMap<string, string> {
         return this.binaries;
+    }
+
+    setReCacheDir(dir: string | undefined): void {
+        this.reCacheDir = dir;
+    }
+
+    async awaitDecompiles(timeoutMs = 45000): Promise<void> {
+        const start = Date.now();
+        while (this.pendingDecompiles.size > 0 && Date.now() - start < timeoutMs) {
+            await new Promise<void>(r => setTimeout(r, 500));
+        }
+    }
+
+    private get autoDecompileNativeEnabled(): boolean {
+        return vscode.workspace
+            .getConfiguration('deepseekContextSync')
+            .get<boolean>('autoDecompileNative', true);
     }
 
     private get decompileEnabled(): boolean {
@@ -137,8 +152,6 @@ export class ContextManager {
 
             this.addPath(rel, notify);
 
-            // DLLs/EXEs costumam passar de 300 KB; antes eram descartados aqui e
-            // nunca chegavam ao inspetor. Binários inspecionáveis têm teto próprio.
             const inspectable = this.inspectBinariesEnabled && isInspectableBinary(rel);
             const sizeLimit = inspectable ? this.maxBinaryBytes : this.maxFileBytes;
             if (stat.size > sizeLimit) {
@@ -151,14 +164,10 @@ export class ContextManager {
 
             const bytes = await vscode.workspace.fs.readFile(uri);
             if (!isProbablyBinary(bytes) && stat.size > this.maxFileBytes) {
-                // Arquivo de texto grande com extensão "inspecionável": segue o limite de texto.
                 this.removeFile(rel, notify);
                 return;
             }
             if (isProbablyBinary(bytes)) {
-                // Em vez de só descartar, gera um resumo textual do PE
-                // (imports/exports/seções). O chat vê o que é o binário sem
-                // receber bytes crus.
                 this.files.delete(rel);
                 if (this.inspectBinariesEnabled && isInspectableBinary(rel)) {
                     try {
@@ -170,8 +179,12 @@ export class ContextManager {
                             const useCache = cached && cached.hash === info.hash;
                             this.binaries.set(rel, useCache ? summary + cached!.block : summary);
                             if (notify) this._onDidChange.fire({ relPath: rel, kind: 'changed' });
-                            if (info.isManaged && !useCache && this.decompileEnabled && !isFrameworkAssembly(rel)) {
-                                this.scheduleDecompile(rel, uri.fsPath, info.hash, summary);
+                            if (!useCache && !isFrameworkAssembly(rel)) {
+                                if (info.isManaged && this.decompileEnabled) {
+                                    this.scheduleDecompile(rel, uri.fsPath, info.hash, summary);
+                                } else if (!info.isManaged && this.autoDecompileNativeEnabled) {
+                                    this.scheduleGhidraDecompile(rel, uri.fsPath, info.hash, summary);
+                                }
                             }
                             return;
                         }
@@ -183,7 +196,6 @@ export class ContextManager {
                 return;
             }
 
-            // Texto: se antes era binário, limpa o cache de resumo.
             this.binaries.delete(rel);
 
             const content = Buffer.from(bytes).toString('utf8');
@@ -196,38 +208,102 @@ export class ContextManager {
         }
     }
 
-    /** Decompila em segundo plano com o ILSpy e anexa o C# ao resumo do binário. */
     private scheduleDecompile(rel: string, fsPath: string, hash: string, summary: string) {
         const cfg = this.decompileSettings;
         if (this.decompileCount >= cfg.maxAssemblies) return;
         this.decompileCount++;
 
+        this.pendingDecompiles.add(rel);
+
         void this.decompileLimiter.run(async () => {
-            const res = await decompileAssembly(fsPath, {
-                exePath: cfg.exePath,
-                maxChars: cfg.maxChars,
-                timeoutMs: cfg.timeoutMs,
-            });
+            try {
+                const res = await decompileAssembly(fsPath, {
+                    exePath: cfg.exePath,
+                    maxChars: cfg.maxChars,
+                    timeoutMs: cfg.timeoutMs,
+                });
 
-            if (!res.ok) {
-                if (res.reason === 'not-installed' && !this.ilspyWarned) {
-                    this.ilspyWarned = true;
-                    void vscode.window.showInformationMessage(
-                        'DeepSeek Context Sync: para enviar o código das DLLs .NET é preciso o ILSpy em linha de comando. ' +
-                        'Instale com: dotnet tool install --global ilspycmd (ou ajuste "deepseekContextSync.ilspyPath").'
-                    );
+                if (!res.ok) {
+                    if (res.reason === 'not-installed' && !this.ilspyWarned) {
+                        this.ilspyWarned = true;
+                        void vscode.window.showInformationMessage(
+                            'DeepSeek Context Sync: para enviar o código das DLLs .NET é preciso o ILSpy em linha de comando. ' +
+                            'Instale com: dotnet tool install --global ilspycmd (ou ajuste "deepseekContextSync.ilspyPath").'
+                        );
+                    }
+                    return;
                 }
-                return;
+
+                if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) return;
+
+                const note = res.truncated ? '\n// [código truncado pelo limite "maxDecompiledKB"]' : '';
+                const block = `\n\nCódigo C# descompilado (ILSpy):\n${res.code}${note}`;
+                this.decompileCache.set(rel, { hash, block });
+                this.binaries.set(rel, summary + block);
+                this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+            } finally {
+                this.pendingDecompiles.delete(rel);
             }
+        });
+    }
 
-            // O arquivo pode ter mudado ou sido apagado enquanto decompilava.
-            if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) return;
+    private scheduleGhidraDecompile(rel: string, fsPath: string, hash: string, summary: string) {
+        const cfg = vscode.workspace.getConfiguration('deepseekContextSync');
+        const ghidraHome = (cfg.get<string>('ghidraPath', '') || process.env.GHIDRA_HOME || '').trim();
+        if (!ghidraHome) {
+            if (!this.ghidraWarned) {
+                this.ghidraWarned = true;
+                void vscode.window.showInformationMessage(
+                    'DeepSeek Context Sync: para incluir o pseudo-C de DLLs nativas no contexto, ' +
+                    'instale o Ghidra e configure "deepseekContextSync.ghidraPath" (ou GHIDRA_HOME). ' +
+                    'Sem ele, só os metadados (imports/exports/strings) entram no contexto.'
+                );
+            }
+            return;
+        }
 
-            const note = res.truncated ? '\n// [código truncado pelo limite "maxDecompiledKB"]' : '';
-            const block = `\n\nCódigo C# descompilado (ILSpy):\n${res.code}${note}`;
-            this.decompileCache.set(rel, { hash, block });
-            this.binaries.set(rel, summary + block);
-            this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+        const settings = this.decompileSettings;
+        if (this.decompileCount >= settings.maxAssemblies) return;
+        this.decompileCount++;
+
+        this.pendingDecompiles.add(rel);
+        if (!this.ghidraWarned) {
+            this.ghidraWarned = true;
+            void vscode.window.showInformationMessage(
+                `DeepSeek Context Sync: decompilando ${rel} com o Ghidra… ` +
+                'A 1ª análise pode levar vários minutos; o resultado fica em cache.'
+            );
+        }
+
+        void this.decompileLimiter.run(async () => {
+            try {
+                const res = await decompileNativeAll(rel, {
+                    workspaceRoot: this.workspaceRoot,
+                    ghidraHome,
+                    scriptDir: path.join(__dirname, '..', 'ghidra'),
+                    cacheDir: this.reCacheDir,
+                    maxDecompiledChars: settings.maxChars,
+                }, {
+                    limit: 40,
+                    maxChars: settings.maxChars,
+                });
+
+                if (!res.ok) {
+                    console.warn('[DeepSeek Context Sync] Ghidra falhou em', rel, ':', res.text.slice(0, 300));
+                    return;
+                }
+
+                if (!this.allPaths.has(rel) || this.binaryHash.get(rel) !== hash) return;
+
+                const block = `\n\nCódigo decompilado (Ghidra):\n${res.text}`;
+                this.decompileCache.set(rel, { hash, block });
+                this.binaries.set(rel, summary + block);
+                this._onDidChange.fire({ relPath: rel, kind: 'changed' });
+            } catch (e) {
+                console.warn('[DeepSeek Context Sync] Ghidra exception em', rel, ':', e);
+            } finally {
+                this.pendingDecompiles.delete(rel);
+            }
         });
     }
 
@@ -254,6 +330,7 @@ export class ContextManager {
         this.binaries.delete(rel);
         this.decompileCache.delete(rel);
         this.binaryHash.delete(rel);
+        this.pendingDecompiles.delete(rel);
         this.removePath(rel, true);
         const prefix = rel + '/';
         for (const key of [...this.files.keys()]) {
@@ -265,6 +342,9 @@ export class ContextManager {
                 this.decompileCache.delete(key);
                 this.binaryHash.delete(key);
             }
+        }
+        for (const key of [...this.pendingDecompiles]) {
+            if (key.startsWith(prefix)) this.pendingDecompiles.delete(key);
         }
         for (const key of [...this.allPaths]) {
             if (key.startsWith(prefix)) this.removePath(key, true);
@@ -298,6 +378,17 @@ export class ContextManager {
         };
         render(root, 0);
 
+        const withCode: string[] = [];
+        for (const [rel, block] of this.binaries) {
+            if (block.includes('Código decompilado (')) withCode.push(rel);
+        }
+        withCode.sort();
+        if (withCode.length > 0) {
+            lines.push('');
+            lines.push('--- binários com código disponível no contexto ---');
+            for (const rel of withCode) lines.push(`[decompilado] ${rel}`);
+        }
+
         if (lines.length === 0) return '(vazio)';
         if (lines.length > MAX_TREE_LINES) {
             const extra = lines.length - MAX_TREE_LINES;
@@ -323,7 +414,6 @@ export class ContextManager {
             files++;
         }
 
-        // Binários resumidos entram depois do código-fonte (mesmo orçamento).
         for (const rel of [...this.binaries.keys()].sort()) {
             const summary = this.binaries.get(rel);
             if (!summary) continue;
@@ -343,11 +433,6 @@ export class ContextManager {
         return { text, files, chars: text.length, omitted };
     }
 
-    /**
-     * Contexto completo ordenado por importância, com orçamento de tokens.
-     * Entradas priorizam entry points, configs, READMEs e hubs; o resto vai até
-     * o limite. Requer o índice (IndexData) para conhecer os tamanhos.
-     */
     buildFullWithBudget(maxTokens: number, index: IndexData): FullResult {
         const budget = new ContextBudget(index);
         const result = budget.compute(maxTokens);
@@ -362,7 +447,6 @@ export class ContextManager {
             files++;
         }
 
-        // Binários resumidos entram depois do texto, sob o mesmo orçamento.
         const binOmitted: string[] = [];
         for (const rel of [...this.binaries.keys()].sort()) {
             const summary = this.binaries.get(rel);

@@ -130,7 +130,6 @@ export class WsServer {
                 if (content !== undefined) sentFingerprints.set(rel, hashContent(content));
             };
 
-            /** Despacha a próxima task pronta do MissionController e envia ao navegador. */
             const sendNextDispatch = () => {
                 if (!this.multiagent) return;
                 const context = this.contextManager.buildFull().text;
@@ -145,9 +144,6 @@ export class WsServer {
                             audit
                         });
                     } else {
-                        // Sem próxima task pronta E missão ainda não concluída =
-                        // missão travada (ex.: nenhuma sessão de navegador). Sem
-                        // esse aviso o usuário ficava esperando em silêncio.
                         send({
                             type: 'multiAgentError',
                             error: 'Missão sem próxima task pronta e ainda não concluída. ' +
@@ -302,6 +298,10 @@ export class WsServer {
 
                     case 'request': {
                         if (m.mode === 'full' || !sentFull) {
+                            try {
+                                await this.contextManager.awaitDecompiles(45000);
+                            } catch { /* segue com o que já tem */ }
+
                             const useBudget = vscode.workspace.getConfiguration('deepseekContextSync')
                                 .get<boolean>('useContextBudget', true);
                             const r = (useBudget && this.indexer)
@@ -370,8 +370,6 @@ export class WsServer {
                                 if (it && typeof it === 'object') {
                                     const itObj = it as any;
                                     if (typeof itObj.filePath === 'string') uniquePaths.add(itObj.filePath);
-                                    // MOVE: a ORIGEM tem fingerprint (se foi enviada no
-                                    // contexto); o DESTINO ainda não existe.
                                     if (typeof itObj.moveFrom === 'string') uniquePaths.add(itObj.moveFrom);
                                 }
                             }
@@ -563,11 +561,6 @@ export class WsServer {
                                 ...result,
                                 mission: this.multiagent.mission.currentPlan
                             });
-                            // FIX BUG CRÍTICO: sempre tentar despachar a próxima
-                            // task pronta, INCLUSIVE após rejeição. Antes, o
-                            // servidor só despachava se `accepted === true`, então
-                            // qualquer rejeição do revisor travava a missão para
-                            // sempre (ninguém re-despachava o Dev para refazer).
                             if (result.missionCompleted) {
                                 send({
                                     type: 'multiAgentMissionCompleted',

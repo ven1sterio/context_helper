@@ -91,6 +91,7 @@ const RESPONSE_RULES = [
     '10. Fora dos blocos pode haver uma explicação curta; o código vai somente dentro dos blocos.',
     '11. SEARCH/REPLACE SEMPRE dentro de cerca de código, com a linha "EDIT: caminho" imediatamente antes da cerca. Nunca solte "<<<<<<< SEARCH" no texto corrido.',
     '12. DELETE: só a linha "### DELETE: caminho", sem corpo e sem cerca. Nunca use DELETE para trechos (use EDIT com REPLACE vazio).',
+    '13. NUNCA use "### FILE:" junto com "<<<<<<< SEARCH". Se for editar trechos, use OBRIGATORIAMENTE a linha "EDIT: caminho" sozinha, e o bloco SEARCH/REPLACE logo abaixo. Se for o arquivo inteiro, use "### FILE:" e NENHUM marcador SEARCH/REPLACE dentro.',
     '',
     'Exemplo FORMATO A (ilustrativo): se main.py contém print("hello world") e eu pedir para adicionar outra linha:',
     '',
@@ -137,7 +138,7 @@ const RE_RULES = [
     '- Binário .NET (gerenciado): o sistema usa o ILSpy. info/functions/strings/patch funcionam; decompile aceita o nome do TIPO',
     '  (Namespace.Classe) e devolve C#; disasm do tipo devolve IL; xrefs e asm não existem para .NET. Para editar a lógica .NET,',
     '  prefira o projeto C# gerado em decompiled/<nome> (comando "Decompilar DLL .NET para projeto C#") e recompilar.',
-    '- Máximo de 8 pedidos por resposta. Termine a resposta normalmente com ' + '[[STATUS:CONTINUAR]]' + ' enquanto estiver investigando.',
+    '- Máximo de 8 pedidos por resposta. Termine a resposta normalmente com [[STATUS:CONTINUAR]] enquanto estiver investigando.',
     '- O pseudo-C vem do Ghidra: é aproximação (nomes de variáveis inventados, sem PDB não há nomes de funções internas).',
     '  Não trate como código-fonte original e diga quando estiver inferindo.',
     '- Se existir código-fonte (.c/.cpp) do mesmo binário no projeto, prefira editar o código-fonte e recompilar.',
@@ -151,7 +152,7 @@ function buildReResultPrompt({ text, errors, ignoredFiles }) {
     const parts = ['[RESULTADO DA ENGENHARIA REVERSA]', text || '(sem saída)'];
     if (errors && errors.length) parts.push('', 'Pedidos RE inválidos (corrija a sintaxe):', ...errors.map(e => '- ' + e));
     if (ignoredFiles) parts.push('', 'ATENÇÃO: os blocos FILE:/EDIT: da sua resposta anterior NÃO foram aplicados (não misture com RE). Reenvie depois.');
-    parts.push('', 'Continue a investigação ou conclua. Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e [[FIM-DA-RESPOSTA]].');
+    parts.push('', 'Continue a investigação ou conclua. Termine com [[STATUS:CONTINUAR]] ou [[STATUS:CONCLUIDO]] e com [[FIM-DA-RESPOSTA]].');
     return parts.join('\n');
 }
 
@@ -160,9 +161,6 @@ const DELTA_REMINDER =
     'ou "EDIT:" com blocos SEARCH/REPLACE exatos. Sem trechos e sem "...". ' +
     'Para olhar/alterar binários (.dll/.exe) continue usando as linhas "### RE: operação arquivo ...".';
 
-// ---------------------------------------------------------------------------
-// Modo Full Code (agente autônomo)
-// ---------------------------------------------------------------------------
 const END_MARKER = '[[FIM-DA-RESPOSTA]]';
 const STATUS_CONTINUE = '[[STATUS:CONTINUAR]]';
 const STATUS_DONE = '[[STATUS:CONCLUIDO]]';

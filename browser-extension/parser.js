@@ -20,7 +20,6 @@ const DIFF_MARKER_RE = /^(?:@@ .+ @@|\+\+\+ [ab]\/|--- [ab]\/)/m;
 
 function getProvider() {
     if (window.DSProvider) return window.DSProvider;
-    // Fallback mínimo: se providers/deepseek.js não carregou, ainda funciona para o básico.
     return {
         listAssistantMessages() {
             const selectors = ['ds-markdown', 'markdown'];
@@ -48,7 +47,6 @@ function getProvider() {
     };
 }
 
-/** Todos os nós de resposta do assistente, na ordem da página. */
 function listAssistantMessages() {
     return getProvider().listAssistantMessages();
 }
@@ -106,10 +104,6 @@ function readEditMarker(node) {
     return isPlausiblePath(p) ? p : null;
 }
 
-/**
- * Lê "path:start-end" ou "path:start" de uma linha "### REPLACE_LINES:".
- * Retorna { filePath, replaceLines: { start, end } } ou null.
- */
 function parseReplaceLinesHeader(raw) {
     const m = REPLACE_LINES_MARKER_RE.exec(raw);
     if (!m) return null;
@@ -129,11 +123,6 @@ function parseReplaceLinesTarget(raw) {
     return { filePath, replaceLines: { start, end } };
 }
 
-/**
- * Varre QUALQUER texto (p, h*, pre, texto solto) atrás de `### DELETE: caminho`.
- * Uma linha = uma exclusão. Nunca tem corpo, nunca tem cerca.
- * Retorna uma lista de { filePath, delete: true }, deduplicada por caminho.
- */
 function scanDeletes(text) {
     const seen = new Set();
     const out = [];
@@ -148,11 +137,6 @@ function scanDeletes(text) {
     return out;
 }
 
-/**
- * Varre por `### MOVE: origem -> destino` (ou `RENAME`, `→`, `=>`).
- * Uma linha = um move. `filePath` é o DESTINO, `moveFrom` é a origem.
- * Deduplica por par (origem→destino).
- */
 function scanMoves(text) {
     const seen = new Set();
     const out = [];
@@ -171,20 +155,13 @@ function scanMoves(text) {
     return out;
 }
 
-/**
- * Lê blocos SEARCH/REPLACE linha a linha (tolerante a fechamento ausente ou sem
- * ">>>>>>>"). Cada problema encontrado vai para `opts.warnings` (nunca é ignorado
- * em silêncio).
- *  - opts.path: arquivo de destino quando já se sabe (cabeçalho "EDIT:" fora do texto).
- *  - opts.detectMarkers: reconhece "EDIT: caminho" dentro do próprio texto (vários
- *    arquivos num bloco só ou sem cercas de código).
- */
 function scanEdits(text, opts) {
     const warnings = (opts && opts.warnings) || [];
     const detect = !!(opts && opts.detectMarkers);
     const lines = String(text).replace(/\r\n/g, '\n').split('\n');
     const blocks = [];
     let path = (opts && opts.path) || null;
+    let lastKnownPath = path;
     let n = 0;
     let i = 0;
 
@@ -195,8 +172,15 @@ function scanEdits(text, opts) {
         const line = lines[i];
         if (detect && !EDIT_START_RE.test(line)) {
             const em = EDIT_MARKER_RE.exec(line);
-            if (em) { const p = cleanPath(em[1]); path = isPlausiblePath(p) ? p : null; i++; continue; }
-            if (FILE_MARKER_RE.test(line)) { path = null; i++; continue; }
+            if (em) { const p = cleanPath(em[1]); path = isPlausiblePath(p) ? p : null; lastKnownPath = path; i++; continue; }
+            const fm = FILE_MARKER_RE.exec(line);
+            if (fm) {
+                const p = cleanPath(fm[1]);
+                if (isPlausiblePath(p)) lastKnownPath = p;
+                path = null;
+                i++;
+                continue;
+            }
         }
         if (!EDIT_START_RE.test(line)) { i++; continue; }
 
@@ -216,7 +200,7 @@ function scanEdits(text, opts) {
 
         const rep = [];
         let closed = false;
-        let strict = false; // fechou com ">>>>>>> REPLACE" (linhas em branco antes dele são conteúdo)
+        let strict = false;
         while (i < lines.length) {
             if (EDIT_END_RE.test(lines[i])) { closed = true; strict = /^[ \t]*>/.test(lines[i]); i++; break; }
             if (isBoundary(lines[i])) break;
@@ -224,7 +208,14 @@ function scanEdits(text, opts) {
         }
         if (!strict) while (rep.length && rep[rep.length - 1].trim() === '') rep.pop();
 
-        if (!path) { warnings.push(`bloco ${n}: não há "EDIT: caminho" antes dele.`); continue; }
+        if (!path) {
+            if (lastKnownPath) {
+                path = lastKnownPath;
+            } else {
+                warnings.push(`bloco ${n}: não há "EDIT: caminho" antes dele.`);
+                continue;
+            }
+        }
         const searchText = search.join('\n');
         if (searchText.trim() === '') { warnings.push(`bloco ${n}${where}: SEARCH vazio.`); continue; }
         blocks.push({ filePath: path, isEdit: true, search: searchText, replace: rep.join('\n') });
@@ -240,19 +231,13 @@ function parseItemsFromContainer(container, warnings) {
     const results = [];
     let pendingFilePath = null;
     let pendingEditPath = null;
-    let pendingReplaceLines = null; // { filePath, replaceLines } do próximo <pre>
-    let lastEditPath = null; // vale para os próximos <pre> que só tragam blocos SEARCH/REPLACE
+    let pendingReplaceLines = null;
+    let lastEditPath = null;
 
     for (const node of container.querySelectorAll('h1,h2,h3,h4,h5,h6,p,pre')) {
         if (node.tagName === 'PRE') {
             const raw = codeTextOf(node);
 
-            // FIX: alguns chats (ChatGPT com respostas longas, Gemini com
-            // markdown strict) às vezes embrulham o próprio "### FILE:" e/ou
-            // "EDIT:" DENTRO da mesma cerca de código — o <pre> então começa
-            // com "### FILE: path\n```lang\n..." em vez de o marcador estar
-            // num <p>/<h*> anterior. Nesse caso o <pre> já contém tudo;
-            // delegamos para o parser por texto, que lida bem com esse layout.
             if (/^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?(?:FILE|EDIT|REPLACE_LINES|DELETE|MOVE|RENAME)[ \t]*:/im.test(raw)) {
                 const inner = parseItemsFromText(raw, warnings);
                 for (const p of inner) results.push(p);
@@ -273,7 +258,12 @@ function parseItemsFromContainer(container, warnings) {
                 pendingFilePath = null;
                 lastEditPath = null;
             } else if (pendingFilePath) {
-                results.push({ filePath: pendingFilePath, content: normalizeContent(raw) });
+                if (/^[ \t]*<{5,}[ \t]*(?:SEARCH\b.*)?$/im.test(raw)) {
+                    const blocks = scanEdits(raw, { path: pendingFilePath, warnings });
+                    for (const b of blocks) results.push(b);
+                } else {
+                    results.push({ filePath: pendingFilePath, content: normalizeContent(raw) });
+                }
                 pendingFilePath = null;
                 lastEditPath = null;
             } else if (pendingEditPath || (lastEditPath && hasEditStart(raw))) {
@@ -282,7 +272,6 @@ function parseItemsFromContainer(container, warnings) {
                 if (blocks.length > 0) {
                     for (const b of blocks) results.push(b);
                 } else if (!hasEditStart(raw)) {
-                    // Nunca tratar como arquivo completo: sobrescreveria o arquivo com um trecho qualquer.
                     warnings.push(`${target}: "EDIT:" seguido de código sem blocos SEARCH/REPLACE. Para arquivo inteiro use "### FILE:".`);
                 } else {
                     warnings.push(`${target}: há marcadores "<<<<<<<" mas nenhum bloco SEARCH/REPLACE válido (nada foi aplicado deste trecho).`);
@@ -290,21 +279,17 @@ function parseItemsFromContainer(container, warnings) {
                 lastEditPath = target;
                 pendingEditPath = null;
             } else if (/^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?EDIT[ \t]*:/im.test(raw)) {
-                // Vários "EDIT: caminho" dentro de um único bloco de código.
                 for (const b of scanEdits(raw, { detectMarkers: true, warnings })) results.push(b);
             }
             continue;
         }
         if (node.closest('pre')) continue;
 
-        // SEARCH/REPLACE solto em parágrafos (sem cerca): quem lê é a varredura de texto,
-        // e o EDIT pendente não pode adotar um <pre> posterior que não tem relação.
         if ((pendingEditPath || lastEditPath) && hasEditStart(node.textContent || '')) {
             pendingEditPath = null; lastEditPath = null;
             continue;
         }
 
-        // REPLACE_LINES antes de FILE (o marcador é mais específico).
         const rlP = parseReplaceLinesHeader(node.textContent || '');
         if (rlP) { pendingReplaceLines = rlP; pendingFilePath = null; pendingEditPath = null; lastEditPath = null; continue; }
 
@@ -320,8 +305,6 @@ function parseItemsFromContainer(container, warnings) {
 function parseItemsFromText(text, warnings) {
     const results = [];
 
-    // REPLACE_LINES tem que ser lido ANTES de FILE (o "REPLACE_LINES: a.js:1-2"
-    // não seria pego pelo FILE regex, mas assim garantimos a ordem de saída).
     const replaceLinesRegex = new RegExp(
         '^[ \\t]*(?:#{1,6}[ \\t]*)?(?:\\*\\*)?REPLACE_LINES[ \\t]*:[ \\t]*(.+?)[ \\t]*\\n[ \\t]*' + FENCE + '[\\w+#.-]*\\n([\\s\\S]*?)\\n?[ \\t]*' + FENCE,
         'gim'
@@ -344,13 +327,11 @@ function parseItemsFromText(text, warnings) {
     );
     while ((m = fileRegex.exec(text)) !== null) {
         const p = cleanPath(m[1]);
+        if (/^[ \t]*<{5,}/m.test(m[2])) continue;
         if (isPlausiblePath(p)) results.push({ filePath: p, content: normalizeContent(m[2]) });
     }
-    // Edições: varredura linha a linha; funciona com ou sem cercas de código.
     for (const b of scanEdits(text, { detectMarkers: true, warnings })) results.push(b);
-    // Exclusões: uma linha por arquivo, sem corpo.
     for (const d of scanDeletes(text)) results.push(d);
-    // Moves: uma linha "### MOVE: origem -> destino".
     for (const mv of scanMoves(text)) results.push(mv);
     return results;
 }
@@ -360,10 +341,7 @@ function findViolations(item) {
     const filePath = item.filePath;
 
     if (item.delete) {
-        // DELETE é só a linha "### DELETE: caminho" — nada de conteúdo para checar.
-        // (Se o modelo escreveu corpo, ele foi ignorado na leitura.)
     } else if (item.moveFrom) {
-        // MOVE: só valida os caminhos.
         if (item.moveFrom === item.filePath) {
             problems.push('origem e destino iguais');
         }
@@ -413,8 +391,6 @@ function parseLastResponse() {
         found = parseItemsFromText(fullText, warnings);
         for (const f of found) if (f.isEdit) f.unfenced = true;
     } else {
-        // Edições escritas FORA de cerca de código viram parágrafos no chat e o DOM não as vê
-        // como <pre>. A varredura de texto as recupera; as já vistas no DOM são ignoradas.
         const key = (f) => {
             if (f.delete) return 'del\0' + f.filePath;
             if (f.moveFrom) return 'mov\0' + f.moveFrom + '\0' + f.filePath;
@@ -429,13 +405,11 @@ function parseLastResponse() {
             b.unfenced = true;
             found.push(b);
         }
-        // DELETE que o DOM não viu (ex.: tudo dentro de um único <pre>).
         for (const d of scanDeletes(fullText)) {
             if (seen.has(key(d))) continue;
             seen.add(key(d));
             found.push(d);
         }
-        // MOVE que o DOM não viu.
         for (const mv of scanMoves(fullText)) {
             if (seen.has(key(mv))) continue;
             seen.add(key(mv));
@@ -446,12 +420,6 @@ function parseLastResponse() {
         return { error: 'Nenhum bloco "### FILE:", "EDIT:", "### DELETE:", "### MOVE:" ou "### REPLACE_LINES:" encontrado na última resposta.' };
     }
 
-    // Agrupa por caminho. "kind" distingue FILE / EDIT / DELETE / MOVE / REPLACE_LINES.
-    //   - vários EDIT no mesmo arquivo são mantidos (aplicados em ordem);
-    //   - para FILE e DELETE, o último vence;
-    //   - para MOVE, o destino é a "identidade" (filePath);
-    //   - REPLACE_LINES só pode aparecer UMA vez por arquivo (evita deslocamento de linha);
-    //   - misturar kinds diferentes no mesmo caminho = conflito.
     const byPath = new Map();
     const conflicts = new Set();
     for (const f of found) {
@@ -467,8 +435,6 @@ function parseLastResponse() {
         else if (newKind === 'replace_lines') { conflicts.add(f.filePath); continue; }
         else cur.items = [f];
     }
-    // MOVE também "toca" a origem — se algum arquivo aparece como origem de
-    // um MOVE e como destino de qualquer outra operação, é conflito.
     for (const f of found) {
         if (!f.moveFrom) continue;
         const cur = byPath.get(f.moveFrom);
@@ -490,10 +456,6 @@ function parseLastResponse() {
     return { files, problems };
 }
 
-// ---------------------------------------------------------------------------
-// Engenharia reversa de binários (DLL/EXE): "### RE: operação arquivo [args]"
-// Uma linha = um pedido. O VS Code executa (Ghidra headless / patch PE) e devolve o texto.
-// ---------------------------------------------------------------------------
 const RE_MAX_REQUESTS = 8;
 const RE_OPS = new Set(['info', 'functions', 'decompile', 'disasm', 'xrefs', 'strings', 'asm', 'patch']);
 
@@ -529,7 +491,6 @@ function validateReRequest(r) {
     return 'operação desconhecida';
 }
 
-/** Retorna { requests: [{op,file,args,opts}], errors: [string] } a partir de qualquer texto. */
 function scanReRequests(text) {
     const requests = [];
     const errors = [];
@@ -540,7 +501,7 @@ function scanReRequests(text) {
         const body = m[1].replace(/\*+$/, '').trim();
         const sp = body.split(/\s+/);
         const op = (sp[0] || '').toLowerCase();
-        if (!RE_OPS.has(op)) continue; // "RE: assunto de email" etc. não é pedido
+        if (!RE_OPS.has(op)) continue;
         const { args, opts } = tokenizeReArgs(body.slice(sp[0].length));
         const file = args.shift();
         if (!file || !isPlausiblePath(cleanPath(file))) { errors.push(`RE: ${body} → faltou o arquivo`); continue; }
