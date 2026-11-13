@@ -1,4 +1,4 @@
-# DeepSeek Context Sync 2.0
+# context helper
 
 Conecta o VS Code ao chat web do **DeepSeek**, **Gemini** ou **ChatGPT** para atuar como um agente autônomo de desenvolvimento. O sistema envia o contexto do projeto, recebe de volta arquivos e edições, aplica no código, executa testes e corrige a si mesmo.
 
