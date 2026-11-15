@@ -126,10 +126,29 @@ export function isExcludedPath(rel: string): boolean {
  * Abre exceções explícitas (WRITABLE_SENSITIVE_NAMES) sem liberar o conteúdo
  * desses arquivos no contexto enviado ao modelo.
  */
+/**
+ * Nomes GENÉRICOS que só indicam saída de build/cache quando estão na raiz do projeto
+ * (ou na raiz de um pacote de monorepo: packages/x/dist). Em qualquer outro nível são
+ * pastas de código comuns (src/lib/build/, app/api/tmp/route.ts, internal/target/...).
+ * Antes qualquer segmento com esses nomes bloqueava a criação do arquivo, o que
+ * fazia arquivos em pastas aninhadas serem recusados ("ficam de fora").
+ */
+const GENERIC_BUILD_DIRS = new Set(['dist', 'out', 'build', 'target', 'coverage', 'tmp', 'temp', 'bower_components']);
+const MONOREPO_ROOTS = new Set(['packages', 'apps', 'libs', 'services', 'modules']);
+
+function isBlockedDirForWrite(dirs: string[], index: number): boolean {
+    const d = dirs[index];
+    if (!EXCLUDED_DIRS.has(d)) return false;
+    if (!GENERIC_BUILD_DIRS.has(d)) return true;           // node_modules, .git, .next, caches...
+    if (index === 0) return true;                           // dist/ na raiz
+    return index === 2 && MONOREPO_ROOTS.has(dirs[0]);      // packages/x/dist
+}
+
 export function isExcludedPathForWrite(rel: string): boolean {
     const parts = rel.split('/');
     const name = parts[parts.length - 1];
-    if (parts.slice(0, -1).some(d => EXCLUDED_DIRS.has(d))) return true;
+    const dirs = parts.slice(0, -1);
+    if (dirs.some((_, i) => isBlockedDirForWrite(dirs, i))) return true;
     if (WRITABLE_SENSITIVE_NAMES.has(name)) return false;
     return isSensitiveName(name);
 }

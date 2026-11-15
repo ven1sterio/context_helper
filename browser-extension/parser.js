@@ -70,6 +70,58 @@ function readStatus(text) {
     return getProvider().readStatus(text);
 }
 
+
+// ---------------------------------------------------------------------------
+// Texto "cru" do markdown renderizado.
+//
+// BUG corrigido (caminhos errados em pastas aninhadas): o chat renderiza o markdown
+// ANTES de o parser ler a página. "### FILE: src/__tests__/a.test.ts" vira
+// <strong>tests</strong> e o `textContent` devolve "src/tests/a.test.ts" — os
+// sublinhados somem e o arquivo é criado na pasta errada. O mesmo vale para
+// __mocks__, __init__.py, _components... Esta função devolve o texto restaurando
+// os marcadores de ênfase quando o <strong>/<em> está COLADO em outros caracteres
+// do caminho (no meio de um token), que é o caso de nomes de pasta/arquivo.
+// ---------------------------------------------------------------------------
+const BLOCK_TAGS = new Set(['P', 'DIV', 'LI', 'UL', 'OL', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'TR', 'TABLE']);
+
+function rawMarkdownText(root) {
+    if (!root || !root.childNodes) return (root && (root.innerText || root.textContent)) || '';
+    let out = '';
+    const walk = (n) => {
+        for (const c of n.childNodes) {
+            if (c.nodeType === 3) { out += c.nodeValue; continue; }
+            if (c.nodeType !== 1) continue;
+            const tag = c.tagName;
+            if (tag === 'STRONG' || tag === 'B' || tag === 'EM' || tag === 'I') {
+                const before = out.slice(-1);
+                const next = c.nextSibling;
+                const after = next ? (next.nodeType === 3 ? (next.nodeValue || '').charAt(0) : 'x') : '';
+                const glued = (before && !/\s/.test(before)) || (after && !/\s/.test(after));
+                const mark = (tag === 'STRONG' || tag === 'B') ? '__' : '_';
+                if (glued) out += mark;
+                walk(c);
+                if (glued) out += mark;
+            } else if (tag === 'BR') {
+                out += '\n';
+            } else if (tag === 'PRE') {
+                out += '\n' + (c.textContent || '') + '\n';
+            } else if (BLOCK_TAGS.has(tag)) {
+                if (out && !out.endsWith('\n')) out += '\n';
+                walk(c);
+                if (!out.endsWith('\n')) out += '\n';
+            } else {
+                walk(c);
+            }
+        }
+    };
+    walk(root);
+    return out;
+}
+
+function firstLineRaw(node) {
+    return rawMarkdownText(node).trim().split('\n')[0];
+}
+
 function cleanPath(raw) {
     return raw.replace(/^[\s`'"*]+|[\s`'"*]+$/g, '').replace(/\\/g, '/');
 }
@@ -92,7 +144,7 @@ function codeTextOf(pre) {
 }
 
 function readFileMarker(node) {
-    const firstLine = (node.textContent || '').trim().split('\n')[0];
+    const firstLine = firstLineRaw(node);
     const m = FILE_MARKER_RE.exec(firstLine);
     if (!m) return null;
     const p = cleanPath(m[1]);
@@ -100,7 +152,7 @@ function readFileMarker(node) {
 }
 
 function readEditMarker(node) {
-    const firstLine = (node.textContent || '').trim().split('\n')[0];
+    const firstLine = firstLineRaw(node);
     const m = EDIT_MARKER_RE.exec(firstLine);
     if (!m) return null;
     const p = cleanPath(m[1]);
@@ -293,7 +345,7 @@ function parseItemsFromContainer(container, warnings) {
             continue;
         }
 
-        const rlP = parseReplaceLinesHeader(node.textContent || '');
+        const rlP = parseReplaceLinesHeader(firstLineRaw(node));
         if (rlP) { pendingReplaceLines = rlP; pendingFilePath = null; pendingEditPath = null; lastEditPath = null; continue; }
 
         const fileP = readFileMarker(node);
@@ -388,7 +440,8 @@ function parseLastResponse() {
     }
 
     const warnings = [];
-    const fullText = container.innerText || container.textContent || '';
+    // Texto com os sublinhados restaurados (ver rawMarkdownText); cai no innerText se vier vazio.
+    const fullText = rawMarkdownText(container) || container.innerText || container.textContent || '';
     let found = parseItemsFromContainer(container, warnings);
     if (found.length === 0) {
         warnings.length = 0;

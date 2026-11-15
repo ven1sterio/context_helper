@@ -66,3 +66,33 @@ test('prompt ensina o formato novo e não o antigo', () => {
     assert.ok(RESPONSE_RULES.includes('[[END]]'));
     assert.ok(!RESPONSE_RULES.includes('>>>>>>> REPLACE'));
 });
+
+// ---- caminhos aninhados: markdown renderizado come os sublinhados ----
+function fakeNode(tag, children) {
+    return { nodeType: 1, tagName: tag, childNodes: children.map(c => typeof c === 'string' ? { nodeType: 3, nodeValue: c } : c), get nextSibling() { return null; } };
+}
+function link(parent) {
+    parent.childNodes.forEach((c, i) => { Object.defineProperty(c, 'nextSibling', { get: () => parent.childNodes[i + 1] || null, configurable: true }); if (c.childNodes) link(c); });
+    return parent;
+}
+
+test('rawMarkdownText restaura __tests__ comido pelo markdown (<strong>)', () => {
+    const { rawMarkdownText } = load();
+    const h = link(fakeNode('H3', ['FILE: src/components/', fakeNode('STRONG', ['tests']), '/Button.test.tsx']));
+    assert.equal(rawMarkdownText(h).trim(), 'FILE: src/components/__tests__/Button.test.tsx');
+});
+
+test('rawMarkdownText restaura __init__.py e não mexe em negrito de linha inteira', () => {
+    const { rawMarkdownText } = load();
+    const a = link(fakeNode('P', ['FILE: app/pkg/', fakeNode('STRONG', ['init']), '.py']));
+    assert.equal(rawMarkdownText(a).trim(), 'FILE: app/pkg/__init__.py');
+    const b = link(fakeNode('P', [fakeNode('STRONG', ['FILE: src/a/b/c.ts'])]));
+    assert.equal(rawMarkdownText(b).trim(), 'FILE: src/a/b/c.ts');
+});
+
+test('caminho com 3+ pastas e crases é lido por inteiro', () => {
+    const { parseItemsFromText } = load();
+    const r = parseItemsFromText(['### FILE: `src/app/(auth)/[locale]/login/page.tsx`', F + 'tsx', 'export default 1;', F].join('\n'), []);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].filePath, 'src/app/(auth)/[locale]/login/page.tsx');
+});
