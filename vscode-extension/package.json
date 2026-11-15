@@ -43,8 +43,8 @@
         },
         "deepseekContextSync.maxTotalKB": {
           "type": "number",
-          "default": 800,
-          "description": "Tamanho máximo (KB) de cada envio ao chat."
+          "default": 200,
+          "description": "Tamanho máximo (KB) de cada envio ao chat. O navegador ainda aplica um teto por provedor (DeepSeek ~150 KB). Valores altos causam \"Content is too long\"."
         },
         "deepseekContextSync.maxContextTokens": {
           "type": "number",

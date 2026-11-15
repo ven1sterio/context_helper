@@ -122,8 +122,14 @@ export class ContextManager {
     }
 
     private get maxTotalChars(): number {
-        const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 800);
+        const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 200);
         return kb * 1024;
+    }
+
+    /** Teto efetivo: o menor entre a configuração e o limite informado pelo navegador (por provedor). */
+    effectiveMaxChars(override?: number): number {
+        const cfg = this.maxTotalChars;
+        return (override && override > 0) ? Math.min(cfg, override) : cfg;
     }
 
     getFile(rel: string): string | undefined {
@@ -584,8 +590,8 @@ export class ContextManager {
         return lines.join('\n');
     }
 
-    buildFull(): FullResult {
-        const max = this.maxTotalChars;
+    buildFull(maxCharsOverride?: number): FullResult {
+        const max = this.effectiveMaxChars(maxCharsOverride);
         let text = '';
         let files = 0;
         const omitted: string[] = [];
@@ -656,8 +662,8 @@ export class ContextManager {
         return { text, files, chars: text.length, omitted: allOmitted };
     }
 
-    buildDelta(pending: Map<string, ChangeKind>): DeltaResult {
-        const max = this.maxTotalChars;
+    buildDelta(pending: Map<string, ChangeKind>, maxCharsOverride?: number): DeltaResult {
+        const max = this.effectiveMaxChars(maxCharsOverride);
         let text = '';
         const included: string[] = [];
 

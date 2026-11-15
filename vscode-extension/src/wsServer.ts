@@ -57,6 +57,14 @@ export interface WsServerOptions {
     onError?: (err: Error) => void;
 }
 
+interface ConvState {
+    pending: Map<string, ChangeKind>;
+    treeDirty: boolean;
+    sentFull: boolean;
+    sentFingerprints: Map<string, string>;
+    touched: number;
+}
+
 const ALLOWED_ORIGINS = [
     'https://chat.deepseek.com',
     'https://gemini.google.com',
@@ -80,6 +88,9 @@ export class WsServer {
     private abortRequested = false;
     private configSub: vscode.Disposable | null = null;
     private contextSubs: vscode.Disposable[] = [];
+    /** Estado de contexto por CONVERSA do chat (sobrevive a F5/reconexão do WebSocket). */
+    private convStates = new Map<string, ConvState>();
+    private connSeq = 0;
 
     constructor(private contextManager: ContextManager, options: WsServerOptions) {
         this.token = options.token;
@@ -119,16 +130,23 @@ export class WsServer {
             })
         );
 
-        this.wss.on('connection', (ws) => {
-            const pending = new Map<string, ChangeKind>();
-            let treeDirty = false;
-            let sentFull = false;
+        // Mudanças de arquivo alimentam TODAS as conversas conhecidas (não só a conexão aberta):
+        // assim, após F5/reconexão, o delta continua correto e o contexto completo NÃO é reenviado.
+        this.contextSubs.push(
+            this.contextManager.onDidChange(e => {
+                for (const c of this.convStates.values()) c.pending.set(e.relPath, e.kind);
+            }),
+            this.contextManager.onDidChangeTree(() => {
+                for (const c of this.convStates.values()) c.treeDirty = true;
+            })
+        );
 
-            const sentFingerprints = new Map<string, string>();
+        this.wss.on('connection', (ws) => {
+            const connKey = `conn-${++this.connSeq}`;
+            let conv = this.getConv(connKey);
+            let bound = false;
 
             const subs = [
-                this.contextManager.onDidChange(e => { pending.set(e.relPath, e.kind); }),
-                this.contextManager.onDidChangeTree(() => { treeDirty = true; }),
                 this.contextManager.onDecompileProgress(snap => {
                     send({ type: 'decompileProgress', ...snap });
                 })
@@ -140,7 +158,7 @@ export class WsServer {
 
             const registerFingerprint = (rel: string) => {
                 const content = this.contextManager.getFile(rel);
-                if (content !== undefined) sentFingerprints.set(rel, hashContent(content));
+                if (content !== undefined) conv.sentFingerprints.set(rel, hashContent(content));
             };
 
             const sendNextDispatch = () => {
@@ -310,8 +328,26 @@ export class WsServer {
                         return;
                     }
 
+                    case 'bindConversation': {
+                        // O navegador informa em qual conversa está (URL). Reaproveita o estado
+                        // se ela já recebeu contexto antes (F5, reconexão, SW reiniciado).
+                        const key = String(m.key);
+                        const from = m.from ? String(m.from) : undefined;
+                        if (!bound) this.convStates.delete(connKey);
+                        if (from && from !== key && this.convStates.has(from) && !this.convStates.has(key)) {
+                            this.convStates.set(key, this.convStates.get(from)!);
+                            this.convStates.delete(from);
+                        }
+                        conv = this.getConv(key);
+                        bound = true;
+                        send({ type: 'conversationBound', key, sentFull: conv.sentFull, pending: conv.pending.size });
+                        return;
+                    }
+
                     case 'request': {
-                        if (m.mode === 'full' || !sentFull) {
+                        conv.touched = Date.now();
+                        const maxChars = (m as any).maxChars as number | undefined;
+                        if (m.mode === 'full' || !conv.sentFull) {
                             let awaitRes: { timedOut: boolean; stillPending: string[] } = { timedOut: false, stillPending: [] };
                             try {
                                 awaitRes = await this.contextManager.awaitDecompiles(45000);
@@ -320,10 +356,10 @@ export class WsServer {
                             const useBudget = vscode.workspace.getConfiguration('deepseekContextSync')
                                 .get<boolean>('useContextBudget', true);
                             const r = (useBudget && this.indexer)
-                                ? this.contextManager.buildFullWithBudget(this.fullBudgetTokens(), this.indexer.getIndex())
-                                : this.contextManager.buildFull();
+                                ? this.contextManager.buildFullWithBudget(this.fullBudgetTokens(maxChars), this.indexer.getIndex())
+                                : this.contextManager.buildFull(maxChars);
 
-                            pending.clear(); treeDirty = false; sentFull = true;
+                            conv.pending.clear(); conv.treeDirty = false; conv.sentFull = true;
 
                             const omittedSet = new Set(r.omitted);
                             for (const [rel] of this.contextManager.getAllFiles()) {
@@ -339,14 +375,14 @@ export class WsServer {
                                 decompilePending: awaitRes.stillPending
                             });
                         } else {
-                            const r = this.contextManager.buildDelta(pending);
-                            for (const p of r.included) pending.delete(p);
-                            const sendTree = treeDirty; treeDirty = false;
+                            const r = this.contextManager.buildDelta(conv.pending, maxChars);
+                            for (const p of r.included) conv.pending.delete(p);
+                            const sendTree = conv.treeDirty; conv.treeDirty = false;
 
                             for (const rel of r.included) {
                                 const content = this.contextManager.getFile(rel);
                                 if (content !== undefined) registerFingerprint(rel);
-                                else sentFingerprints.delete(rel);
+                                else conv.sentFingerprints.delete(rel);
                             }
 
                             send({
@@ -354,7 +390,7 @@ export class WsServer {
                                 mode: (r.included.length > 0 || sendTree) ? 'delta' : 'empty',
                                 data: r.text,
                                 tree: sendTree ? this.contextManager.buildTree() : undefined,
-                                files: r.included.length, chars: r.chars, remaining: pending.size
+                                files: r.included.length, chars: r.chars, remaining: conv.pending.size
                             });
                         }
                         return;
@@ -390,7 +426,7 @@ export class WsServer {
                                     if (typeof itObj.moveFrom === 'string') uniquePaths.add(itObj.moveFrom);
                                 }
                             }
-                            const conflicts = this.detectConflicts([...uniquePaths], sentFingerprints);
+                            const conflicts = this.detectConflicts([...uniquePaths], conv.sentFingerprints);
 
                             if (conflicts.length > 0 && auto) {
                                 send({
@@ -463,8 +499,8 @@ export class WsServer {
                                     for (const rel of result.files) {
                                         const abs = path.join(root, rel.split('/').join(path.sep));
                                         const fp = fingerprintFile(abs);
-                                        if (fp) sentFingerprints.set(rel, fp);
-                                        else sentFingerprints.delete(rel);
+                                        if (fp) conv.sentFingerprints.set(rel, fp);
+                                        else conv.sentFingerprints.delete(rel);
                                     }
                                 }
                             }
@@ -629,6 +665,7 @@ export class WsServer {
             });
 
             ws.on('close', () => {
+                if (!bound) this.convStates.delete(connKey);
                 auth.dispose();
                 subs.forEach(s => s.dispose());
             });
@@ -653,9 +690,26 @@ export class WsServer {
         return conflicts;
     }
 
-    private fullBudgetTokens(): number {
-        const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 800);
-        return Math.max(2000, Math.floor(kb * 1024 / 4));
+    private fullBudgetTokens(maxChars?: number): number {
+        const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 200);
+        const cfgChars = kb * 1024;
+        const chars = (maxChars && maxChars > 0) ? Math.min(cfgChars, maxChars) : cfgChars;
+        return Math.max(2000, Math.floor(chars / 4));
+    }
+
+    private getConv(key: string): ConvState {
+        let c = this.convStates.get(key);
+        if (!c) {
+            c = { pending: new Map(), treeDirty: false, sentFull: false, sentFingerprints: new Map(), touched: Date.now() };
+            this.convStates.set(key, c);
+            // Limita memória: descarta as conversas mais antigas (mantém no máx. 30).
+            if (this.convStates.size > 30) {
+                const oldest = [...this.convStates.entries()].sort((a, b) => a[1].touched - b[1].touched)[0];
+                if (oldest && oldest[0] !== key) this.convStates.delete(oldest[0]);
+            }
+        }
+        c.touched = Date.now();
+        return c;
     }
 
     private buildNextPrompt(

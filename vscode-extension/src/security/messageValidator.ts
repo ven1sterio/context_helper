@@ -23,7 +23,8 @@ export type ValidatedMessage =
     | { type: 'ping' }
     | { type: 'abort' }
     | { type: 'getState' }
-    | { type: 'request'; mode: string }
+    | { type: 'request'; mode: string; maxChars?: number }
+    | { type: 'bindConversation'; key: string; from?: string }
     | {
         type: 'applyFiles';
         files: unknown[];
@@ -157,7 +158,16 @@ export function validateMessage(raw: unknown): ValidationResult {
         case 'request': {
             const mode = isString(m.mode) ? m.mode : '';
             if (mode.length > 32) return fail('modo inválido');
-            return { ok: true, message: { type: 'request', mode } };
+            const maxChars = (typeof m.maxChars === 'number' && isFinite(m.maxChars) && m.maxChars > 0)
+                ? Math.min(Math.floor(m.maxChars), 4 * 1024 * 1024) : undefined;
+            return { ok: true, message: { type: 'request', mode, maxChars } };
+        }
+
+        case 'bindConversation': {
+            const key = isString(m.key) ? m.key : '';
+            if (!key || key.length > 300) return fail('bindConversation: chave inválida');
+            const from = isString(m.from) && m.from.length <= 300 ? m.from : undefined;
+            return { ok: true, message: { type: 'bindConversation', key, from } };
         }
 
         case 'applyFiles': {
