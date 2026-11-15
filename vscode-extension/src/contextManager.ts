@@ -24,6 +24,46 @@ export interface DecompileFailure {
     detail: string;
 }
 
+export type DecompileStatus = 'queued' | 'running' | 'done' | 'failed' | 'skipped';
+
+/**
+ * Estado de UMA decompilação (uma DLL/EXE específica). O `contextManager`
+ * mantém um job por arquivo binário, atualiza o `status` conforme o
+ * `Limiter` libera as vagas e mantém isso para a status bar e para o
+ * output channel de diagnóstico (`extension.ts` → "Ver Progresso de Decompilação").
+ */
+export interface DecompileJob {
+    rel: string;
+    kind: 'dotnet' | 'ghidra';
+    status: DecompileStatus;
+    /** ISO timestamp de quando entrou na fila. */
+    queuedAt: string;
+    /** ISO timestamp de quando começou a rodar (ausente se ainda está queued). */
+    startedAt?: string;
+    /** ISO timestamp de quando terminou (done/failed/skipped). */
+    endedAt?: string;
+    /** Motivo da falha/skip (primeira linha; detalhes vão para o OutputChannel). */
+    error?: string;
+    /** true se o resultado foi truncado no limite de `maxDecompiledKB`. */
+    truncated?: boolean;
+}
+
+/**
+ * Snapshot agregado do progresso de decompilação — o que a status bar do
+ * VS Code e o painel do navegador recebem via `onDecompileProgress`.
+ */
+export interface DecompileProgressSnapshot {
+    jobs: DecompileJob[];
+    queued: number;
+    running: number;
+    done: number;
+    failed: number;
+    skipped: number;
+    total: number;
+    /** true se ainda há jobs na fila ou rodando (a UI usa para mostrar o spinner). */
+    isWorking: boolean;
+}
+
 export interface FullResult {
     text: string;
     files: number;
