@@ -81,7 +81,10 @@
     class Panel {
         constructor(opts) {
             this.opts = opts || {};
+            // Painel aberto/fechado sobrevive ao F5 (antes sempre voltava fechado e,
+            // se o site recriasse o <body>, o botão sumia e era preciso insistir).
             this.expanded = false;
+            try { this.expanded = sessionStorage.getItem('ds-panel-open') === '1'; } catch { /* ignore */ }
             this.fullCodeMode = false;
             this.instantMode = false;
             this.selectReview = false;
@@ -243,6 +246,10 @@
             root.append(toast, panel, fab);
             document.body.appendChild(root);
 
+            if (this.expanded) panel.classList.add('ds-open');
+            this._styleEl = style;
+            this._guardAttachment();
+
             this._els = {
                 root, toast, panel,
                 statusRow, statusDot, statusLabel,
@@ -251,6 +258,35 @@
                 selPanel, selHeader, selList, selApply, selCancel,
                 fab, fabIcon, fabDot, fabBadge
             };
+        }
+
+        /**
+         * Sites como DeepSeek/ChatGPT/Gemini hidratam/recriam o <body> logo após o load
+         * (principalmente após F5). Isso REMOVIA o painel e o FAB — "a aba fecha sozinha".
+         * Este guardião recoloca o root (e o <style>) sempre que forem removidos.
+         */
+        _guardAttachment() {
+            if (this._guard) { try { this._guard.disconnect(); } catch { /* ignore */ } }
+            let scheduled = false;
+            const restore = () => {
+                scheduled = false;
+                const root = this._els.root;
+                const style = this._styleEl;
+                if (!root || !document.body) return;
+                if (style && !style.isConnected) (document.head || document.documentElement).appendChild(style);
+                if (!root.isConnected) document.body.appendChild(root);
+            };
+            this._guard = new MutationObserver(() => {
+                const root = this._els.root;
+                if (root && root.isConnected && (!this._styleEl || this._styleEl.isConnected)) return;
+                if (scheduled) return;
+                scheduled = true;
+                setTimeout(restore, 50);
+            });
+            this._guard.observe(document.documentElement, { childList: true, subtree: true });
+            // Rede de segurança: o body inteiro pode ser trocado sem mutação visível ao observer.
+            clearInterval(this._guardTimer);
+            this._guardTimer = setInterval(restore, 2000);
         }
 
         _btn(label, cls, onClick) {
@@ -264,6 +300,7 @@
 
         togglePanel() {
             this.expanded = !this.expanded;
+            try { sessionStorage.setItem('ds-panel-open', this.expanded ? '1' : '0'); } catch { /* ignore */ }
             this._els.panel.classList.toggle('ds-open', this.expanded);
             this.update(state && { state: state.state, connected: state.connected });
         }

@@ -52,6 +52,11 @@
 
             this.reconnectAttempts = 0;
 
+            // Conversa do chat à qual esta aba está ligada (sobrevive a F5/reconexão no servidor).
+            this._boundKey = null;
+            this._pageNonce = Math.random().toString(36).slice(2, 8);
+            this._watchTimer = null;
+
             this._handlers = {};
         }
 
@@ -95,6 +100,11 @@
                 this.connected = true;
                 this.nextIsDelta = false;
                 this.reconnectAttempts = 0;
+                // Reconectou (F5, SW reiniciado...): pede ao servidor o estado DESTA conversa.
+                // Assim o contexto completo não é reenviado (duplicado) para um chat que já o tem.
+                this._boundKey = null;
+                this.bindConversation();
+                this._startConversationWatch();
                 this._notify('open');
             };
 
@@ -122,6 +132,9 @@
             if (t === 'config' && msg.timeouts) {
                 this.timeouts = { ...this.timeouts, ...msg.timeouts };
                 this._notify('config', this.timeouts);
+            } else if (t === 'conversationBound') {
+                this.nextIsDelta = !!msg.sentFull;
+                this._notify('conversationBound', msg);
             } else if (t === 'context') {
                 this._finish('waiting', msg);
             } else if (t === 'applyResult') {
@@ -199,12 +212,41 @@
             this.reconnectTimer = setTimeout(() => this.connect(), delay);
         }
 
+        /** Chave da conversa atual. Chat novo (raiz) usa um nonce por carregamento de página. */
+        conversationKey() {
+            const path = (location.pathname || '/').replace(/\/+$/, '') || '/';
+            const isRoot = path === '/' || /^\/(app|new)$/.test(path);
+            return location.hostname + (isRoot ? '/#new-' + this._pageNonce : path);
+        }
+
+        bindConversation() {
+            if (!this.isOpen()) return;
+            const key = this.conversationKey();
+            if (key === this._boundKey) return;
+            // Chat novo que virou conversa real (URL mudou após a 1ª mensagem): transfere o estado.
+            const from = (this._boundKey && this._boundKey.includes('/#new-')) ? this._boundKey : undefined;
+            this._boundKey = key;
+            try { this.ws.send(JSON.stringify({ type: 'bindConversation', key, from })); } catch { /* ignore */ }
+        }
+
+        _startConversationWatch() {
+            clearInterval(this._watchTimer);
+            // Navegação SPA não recarrega a página: vigia a URL.
+            this._watchTimer = setInterval(() => {
+                if (!this.isOpen()) return;
+                if (this._boundKey !== this.conversationKey()) this.bindConversation();
+            }, 1000);
+        }
+
         requestContext(mode) {
             return new Promise((resolve) => {
                 if (!this.isOpen() || this.waiting) { resolve(null); return; }
-                const timer = setTimeout(() => this._finish('waiting', null), 5000);
+                const timer = setTimeout(() => this._finish('waiting', null), mode === 'full' ? 60000 : 15000);
                 this.waiting = { resolve, timer };
-                this.ws.send(JSON.stringify({ type: 'request', mode }));
+                // maxChars: teto de tamanho deste site; o servidor usa o menor entre ele e maxTotalKB.
+                let maxChars;
+                try { maxChars = window.DS.getProvider().maxContextChars; } catch { /* ignore */ }
+                this.ws.send(JSON.stringify({ type: 'request', mode, maxChars }));
             });
         }
 

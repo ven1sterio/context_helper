@@ -112,6 +112,8 @@
             // Acima disso o contexto vai como ARQUIVO anexo: colar centenas de KB
             // no editor Quill (Angular) congela a aba.
             this.maxInlineChars = 40000;
+            // Teto do contexto enviado por este site (o servidor usa o menor entre este e maxTotalKB).
+            this.maxContextChars = 400000;
             this.supportsFileAttach = true;
         }
 
@@ -208,54 +210,15 @@
             return false;
         }
 
-        /** Há um chip de anexo mostrando esse nome de arquivo? */
+
+        /** Há um chip de anexo mostrando esse nome de arquivo? (detecção por texto, não por classe CSS) */
         hasAttachmentChip(name) {
-            const nodes = document.querySelectorAll(
-                'uploader-file-preview-container, uploader-file-preview, file-preview, ' +
-                '[class*="preview" i], [class*="upload" i], [class*="attachment" i]'
-            );
-            for (const n of nodes) if ((n.textContent || '').includes(name)) return true;
-            return false;
+            return window.DS.countFileChips(name, this.findInput()) > 0;
         }
 
-        /**
-         * Anexa `text` como arquivo .txt (cola um File no editor; se o Gemini
-         * ignorar, tenta um "drop"). Devolve true só se o chip aparecer.
-         */
+        /** Anexa o texto como arquivo. Um método por vez, sem duplicar. */
         async attachTextFile(input, text, filename) {
-            if (!input) return false;
-            let file;
-            try { file = new File([text], filename, { type: 'text/plain' }); } catch { return false; }
-
-            const waitChip = async (ms) => {
-                const end = Date.now() + ms;
-                while (Date.now() < end) {
-                    if (this.hasAttachmentChip(filename)) return true;
-                    await sleep(250);
-                }
-                return false;
-            };
-
-            // 1) paste com File
-            try {
-                input.focus();
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-                if (await waitChip(6000)) return true;
-            } catch { /* tenta o drop */ }
-
-            // 2) drop sobre a área de entrada
-            try {
-                const target = input.closest('rich-textarea') || input.parentElement || input;
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                for (const type of ['dragenter', 'dragover', 'drop']) {
-                    target.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
-                }
-                if (await waitChip(6000)) return true;
-            } catch { /* ignore */ }
-            return false;
+            return window.DS.attachFileOnce(input, text, filename, (input) => input.closest('rich-textarea') || input.parentElement || input);
         }
 
         findSendButton() {

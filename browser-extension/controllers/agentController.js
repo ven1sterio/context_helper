@@ -217,8 +217,11 @@
 
             const baseline = p.snapshotAssistant();
             let attached = false;
-            if (composed) attached = (await ctx.deliverPrompt(input, composed)).attached;
-            else await ctx.setInputBig(input, textToSend);
+            if (composed) {
+                const delivered = await ctx.deliverPrompt(input, composed);
+                if (delivered.aborted) { window.DS.panel.toast('⏹ Agente parado: já há um anexo de contexto no campo.'); return; }
+                attached = delivered.attached;
+            } else await ctx.setInputBig(input, textToSend);
             await sleep(150);
 
             const sent = await p.pressSend(attached ? 60000 : 6000);

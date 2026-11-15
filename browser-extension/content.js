@@ -102,6 +102,7 @@
             panel.toast('🔑 Token não configurado. Clique em "🔑 Token" no painel.');
         });
         conn.on('config', () => panel.refresh());
+        conn.on('conversationBound', () => panel.refresh());
         conn.on('decompileProgress', (msg) => {
             panel.showDecompileProgress(msg);
         });
@@ -136,6 +137,30 @@
         });
 
         conn.connect();
+
+        // O site recusou a mensagem por tamanho ("Content is too long"): explica o que fazer,
+        // em vez de o usuário ficar tentando reenviar a mesma coisa.
+        let lastTooLongToast = 0;
+        let tooLongPending = false;
+        const tooLongWatch = new MutationObserver(() => {
+            // Debounce: durante o streaming da resposta o DOM muda o tempo todo.
+            if (tooLongPending) return;
+            tooLongPending = true;
+            setTimeout(() => {
+                tooLongPending = false;
+                const now = Date.now();
+                if (now - lastTooLongToast < 15000) return;
+                const notice = window.DS.findTooLongNotice && window.DS.findTooLongNotice();
+                if (!notice) return;
+                lastTooLongToast = now;
+                showTooLong();
+            }, 1200);
+        });
+        const showTooLong = () => {
+            panel.toast('⚠️ O ' + window.DS.siteName() + ' recusou por tamanho. Esta conversa já está cheia ou o contexto é grande: ' +
+                'clique em "🆕 Nova conversa" e use "🎯 Seletivo" / "📎 Anexar alterações" em vez do contexto completo.');
+        };
+        tooLongWatch.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 
         // Recupera estado pendente (nova conversa)
         handlePendingPrompt(panel);

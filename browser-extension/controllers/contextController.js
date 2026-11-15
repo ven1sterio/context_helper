@@ -25,8 +25,20 @@
         return {
             text: build(asFile ? ATTACH_NOTE : data),
             fileText: asFile ? ('[CONTEXTO ATUAL DOS ARQUIVOS]\n' + data) : null,
-            inline: () => build(data)
+            // Fallback colado no campo: NUNCA acima de maxInlineChars (colar centenas de KB
+            // causava "Content is too long" e travava a aba).
+            inline: (limit) => build(truncateAtFile(data, limit))
         };
+    }
+
+    /** Corta `data` no limite, preferindo o início de um bloco "--- arquivo ---". */
+    function truncateAtFile(data, limit) {
+        if (!limit || !data || data.length <= limit) return data;
+        let cut = data.lastIndexOf('\n--- ', limit);
+        if (cut < limit / 2) cut = limit;
+        return data.slice(0, cut) +
+            '\n\n[CONTEXTO TRUNCADO: o projeto é grande demais para colar no campo. ' +
+            'Peça os arquivos que faltam pelo nome ou use o botão \"🎯 Seletivo\".]\n';
     }
 
     async function setInputBig(input, text) {
@@ -44,16 +56,31 @@
         p.setInput(input, text);
     }
 
+    const ATTACH_NAME = 'contexto-projeto.txt';
+
     async function deliverPrompt(input, composed) {
         const p = window.DS.getProvider();
         if (composed.fileText) {
+            // Um anexo antigo ainda no campo: anexar de novo DUPLICARIA o contexto.
+            if (p.hasAttachmentChip && p.hasAttachmentChip(ATTACH_NAME)) {
+                window.DS.panel.toast('⚠️ Já existe um anexo "' + ATTACH_NAME + '" no campo. ' +
+                    'Remova-o (×) ou envie a mensagem antes de anexar de novo.');
+                return { attached: false, aborted: true };
+            }
             window.DS.panel.toast('📎 Anexando o contexto como arquivo (evita travar o ' + window.DS.siteName() + ')...');
             await setInputBig(input, composed.text);
             await sleep(400); // deixa o editor processar antes de anexar
-            const ok = await p.attachTextFile(input, composed.fileText, 'contexto-projeto.txt');
+            const ok = await p.attachTextFile(input, composed.fileText, ATTACH_NAME);
             if (ok) return { attached: true };
-            window.DS.panel.toast('⚠️ Não consegui anexar o arquivo. Colando o texto em partes...');
-            await setInputBig(input, composed.inline());
+
+            // O upload pode ter terminado depois do timeout: confere de novo antes de duplicar.
+            await sleep(3000);
+            if (p.hasAttachmentChip && p.hasAttachmentChip(ATTACH_NAME)) return { attached: true };
+
+            const limit = p.maxInlineChars || 40000;
+            window.DS.panel.toast('⚠️ Não consegui anexar o arquivo. Colando uma versão reduzida (~' +
+                Math.round(limit / 1000) + ' KB). Para projetos grandes use "🎯 Seletivo".');
+            await setInputBig(input, composed.inline(limit));
             return { attached: false };
         }
         await setInputBig(input, composed.text);
@@ -85,6 +112,14 @@
         }
         const question = current.trim();
 
+        // Este chat já recebeu o contexto completo (ex.: antes do F5)? Reenviar duplica tudo.
+        if (mode === 'full' && conn.nextIsDelta &&
+            !confirm('Este chat já recebeu o contexto completo do projeto.\n\n' +
+                'Enviar de novo DUPLICA o conteúdo e aumenta o risco de "Content is too long".\n\n' +
+                'Use "📎 Anexar alterações" para enviar só o que mudou. Enviar o contexto completo mesmo assim?')) {
+            return;
+        }
+
         busyAttach = true;
         try {
             window.DS.panel.toast('Buscando contexto...');
@@ -95,13 +130,15 @@
             const kb = (msg.chars / 1024).toFixed(1);
 
             if (msg.mode === 'full') {
-                await deliverPrompt(input, composePrompt('full', { tree: msg.tree, data: msg.data, question, fullCode: false }));
+                const r = await deliverPrompt(input, composePrompt('full', { tree: msg.tree, data: msg.data, question, fullCode: false }));
+                if (r.aborted) return;
                 conn.nextIsDelta = true;
                 let info = `Contexto completo: ${msg.files} arquivo(s), ${kb} KB.`;
                 if (msg.omitted > 0) info += ` ${msg.omitted} omitido(s) por limite de tamanho.`;
                 window.DS.panel.toast(info);
             } else {
-                await deliverPrompt(input, composePrompt('delta', { tree: msg.tree, data: msg.data, question, fullCode: false }));
+                const r = await deliverPrompt(input, composePrompt('delta', { tree: msg.tree, data: msg.data, question, fullCode: false }));
+                if (r.aborted) return;
                 let info = `Alterações: ${msg.files} arquivo(s), ${kb} KB.`;
                 if (msg.tree) info += ' Estrutura atualizada.';
                 if (msg.remaining > 0) info += ` Restam ${msg.remaining}; clique de novo para enviar.`;
@@ -237,7 +274,8 @@
         const input = p.findInput();
         if (!input) { window.DS.panel.toast('Campo de entrada perdido.'); return; }
 
-        await deliverPrompt(input, composePrompt('full', { tree: res.tree, data: res.data, question, fullCode: false }));
+        const delivered = await deliverPrompt(input, composePrompt('full', { tree: res.tree, data: res.data, question, fullCode: false }));
+        if (delivered.aborted) return;
         conn.nextIsDelta = true;
 
         const kTokens = ((res.tokens || 0) / 1000).toFixed(1);

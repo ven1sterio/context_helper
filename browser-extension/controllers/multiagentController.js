@@ -4,6 +4,7 @@
 (function () {
     'use strict';
     window.DS = window.DS || {};
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const conn = window.DS.connection;
     const ctx = window.DS.context;
 
@@ -48,8 +49,28 @@
             return;
         }
 
-        // Cola o prompt do papel atual
-        await ctx.setInputBig(input, msg.prompt);
+        // Cola o prompt do papel atual. Prompt grande (contexto do projeto embutido) vai como
+        // ANEXO, nunca colado inteiro: colar centenas de KB dá "Content is too long".
+        const limit = p.maxInlineChars || 40000;
+        if (msg.prompt.length > limit && p.supportsFileAttach && p.attachTextFile) {
+            if (p.hasAttachmentChip && p.hasAttachmentChip('contexto-projeto.txt')) {
+                panel().toast('⚠️ Já há um anexo "contexto-projeto.txt" no campo. Remova-o (×) antes de continuar.');
+                return;
+            }
+            await ctx.setInputBig(input, '(O prompt completo desta tarefa está no ANEXO "contexto-projeto.txt". ' +
+                'Leia-o inteiro e responda no formato exigido nele.)');
+            await sleep(400);
+            const ok = await p.attachTextFile(input, msg.prompt, 'contexto-projeto.txt');
+            if (!ok) {
+                await sleep(3000);
+                if (!(p.hasAttachmentChip && p.hasAttachmentChip('contexto-projeto.txt'))) {
+                    panel().toast('⚠️ Não consegui anexar o prompt. Colando versão reduzida.');
+                    await ctx.setInputBig(input, msg.prompt.slice(0, limit) + '\n[PROMPT TRUNCADO]\n');
+                }
+            }
+        } else {
+            await ctx.setInputBig(input, msg.prompt.length > limit ? msg.prompt.slice(0, limit) + '\n[PROMPT TRUNCADO]\n' : msg.prompt);
+        }
         const kind = msg.contract.outputFormat === 'TEXT_ONLY' ? 'texto' : 'código';
         panel().toast(`🤖 ${msg.agentLabel}: revise e envie (${kind}).`);
     }

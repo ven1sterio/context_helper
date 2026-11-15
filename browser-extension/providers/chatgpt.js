@@ -73,6 +73,8 @@
             // Mesmo tratamento do Gemini: acima deste tamanho o contexto vai como
             // ARQUIVO anexo — colar centenas de KB no editor ProseMirror trava a aba.
             this.maxInlineChars = 40000;
+            // Teto do contexto enviado por este site (o servidor usa o menor entre este e maxTotalKB).
+            this.maxContextChars = 200000;
             this.supportsFileAttach = true;
         }
 
@@ -165,54 +167,15 @@
             return false;
         }
 
-        /** Há um chip/preview de anexo mostrando esse nome de arquivo? */
+
+        /** Há um chip de anexo mostrando esse nome de arquivo? (detecção por texto, não por classe CSS) */
         hasAttachmentChip(name) {
-            const input = this.findInput();
-            const nodes = document.querySelectorAll(
-                '[class*="file" i], [class*="upload" i], [class*="attach" i], [class*="preview" i]'
-            );
-            for (const n of nodes) {
-                if (input && (n === input || input.contains(n) || n.contains(input))) continue;
-                const txt = (n.textContent || '').trim();
-                if (txt.length > 200) continue;
-                if (txt.includes(name) && isVisible(n)) return true;
-            }
-            return false;
+            return window.DS.countFileChips(name, this.findInput()) > 0;
         }
 
-        /** Anexa um .txt (paste/drop com File). True só se o chip aparecer. */
+        /** Anexa o texto como arquivo. Um método por vez, sem duplicar. */
         async attachTextFile(input, text, filename) {
-            if (!input) return false;
-            let file;
-            try { file = new File([text], filename, { type: 'text/plain' }); } catch { return false; }
-
-            const waitChip = async (ms) => {
-                const end = Date.now() + ms;
-                while (Date.now() < end) {
-                    if (this.hasAttachmentChip(filename)) return true;
-                    await sleep(250);
-                }
-                return false;
-            };
-
-            try {
-                input.focus();
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                input.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-                if (await waitChip(6000)) return true;
-            } catch { /* tenta o drop */ }
-
-            try {
-                const target = input.closest('form') || input.parentElement || input;
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                for (const type of ['dragenter', 'dragover', 'drop']) {
-                    target.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
-                }
-                if (await waitChip(6000)) return true;
-            } catch { /* ignore */ }
-            return false;
+            return window.DS.attachFileOnce(input, text, filename, (input) => input.closest('form') || input.parentElement || input);
         }
 
         findSendButton() {
