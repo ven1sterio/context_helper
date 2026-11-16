@@ -6,8 +6,57 @@
     const { sleep } = window.DS.protocol;
     const conn = window.DS.connection;
 
-    const ATTACH_NOTE = '(O conteúdo dos arquivos está no ANEXO "contexto-projeto.txt" desta mensagem. ' +
-        'Leia-o inteiro antes de responder; os caminhos e o formato das respostas seguem as regras acima.)';
+    // Nome do anexo quando há 1 parte: "contexto-projeto.txt".
+    // Quando há N partes: "contexto-projeto-1-de-N.txt" … "contexto-projeto-N-de-N.txt".
+    // O `N` é sempre o número REAL de repartições (não fixo em 2).
+    const ATTACH_NAME = 'contexto-projeto.txt';
+    const ATTACH_NAME_BASE = 'contexto-projeto';
+
+    function attachNameFor(index, total) {
+        if (total <= 1) return ATTACH_NAME;
+        return `${ATTACH_NAME_BASE}-${index + 1}-de-${total}.txt`;
+    }
+
+    // Teto de partes por envio (evita 50 anexos num projeto gigante).
+    const MAX_PARTS = 10;
+
+    /**
+     * Quebra o texto do contexto em pedaços BALANCEADOS (targetSize = total/N),
+     * preferindo cortar no início de um bloco "--- arquivo ---". Cap em
+     * MAX_PARTS: acima disso, trunca com aviso. Assim, um contexto de 100 KB
+     * com maxChars=40 KB vira 3 partes de ~33 KB — não 2 cheias + 1 resíduo.
+     */
+    function splitContext(data, maxChars) {
+        if (!data || data.length <= maxChars) return [data || ''];
+        const minChunks = Math.ceil(data.length / maxChars);
+        if (minChunks > MAX_PARTS) {
+            const truncated = data.slice(0, maxChars * MAX_PARTS) +
+                `\n\n[CONTEXTO TRUNCADO: ${data.length} chars excede ${MAX_PARTS} × ${maxChars}. ` +
+                `Use "🎯 Seletivo" para focar em arquivos específicos.]\n`;
+            return splitContext(truncated, maxChars);
+        }
+        const targetSize = Math.ceil(data.length / minChunks);
+        const chunks = [];
+        let remaining = data;
+        while (remaining.length > 0) {
+            if (remaining.length <= targetSize) {
+                chunks.push(remaining);
+                break;
+            }
+            let cut = remaining.lastIndexOf('\n--- ', targetSize);
+            if (cut < targetSize / 2) cut = targetSize;
+            chunks.push(remaining.slice(0, cut));
+            remaining = remaining.slice(cut);
+        }
+        return chunks;
+    }
+
+    function headerFor(kind, index, total) {
+        const part = total > 1 ? ` — parte ${index + 1} de ${total}` : '';
+        return kind === 'full'
+            ? `[CONTEXTO ATUAL DOS ARQUIVOS${part}]`
+            : `[ATUALIZAÇÃO DO PROJETO — arquivos alterados/removidos${part}]`;
+    }
 
     // Flags de reentrância: o usuário pode clicar duas vezes no botão.
     // Sem isso, duas chamadas concorrentes a handleAttach duplicam o prompt
@@ -18,16 +67,49 @@
 
     function composePrompt(kind, { tree, data, question, fullCode }) {
         const p = window.DS.getProvider();
-        const build = (ctx) => kind === 'full'
-            ? buildFullPrompt({ tree, context: ctx, question, fullCode })
-            : buildDeltaPrompt({ tree, changes: ctx, question, fullCode });
-        const asFile = !!(p.supportsFileAttach && p.attachTextFile && data && data.length > (p.maxInlineChars || Infinity));
+        const supportsFiles = !!(p.supportsFileAttach && p.attachTextFile);
+        const maxChars = p.maxInlineChars || 40000;
+
+        // Provider sem anexo (ou contexto vazio): cai no modo antigo (tudo inline).
+        if (!supportsFiles || !data || data.length === 0) {
+            const build = (ctx) => kind === 'full'
+                ? buildFullPrompt({ tree, context: ctx, question, fullCode })
+                : buildDeltaPrompt({ tree, changes: ctx, question, fullCode });
+            return {
+                text: build(data || ''),
+                files: [],
+                inline: (limit) => build(truncateAtFile(data || '', limit))
+            };
+        }
+
+        // REGRAS ficam no TEXTO do chat (curto, estável).
+        const rulesText = kind === 'full'
+            ? buildRulesOnlyFull({ tree, question, fullCode })
+            : buildRulesOnlyDelta({ tree, question, fullCode });
+
+        // CONTEXTO vai em 1+ anexos .txt. Se precisar dividir, cada parte
+        // ganha um cabeçalho "parte i de N".
+        const chunks = splitContext(data, maxChars);
+        const files = chunks.map((content, i) => ({
+            name: attachNameFor(i, chunks.length),
+            content: headerFor(kind, i, chunks.length) + '\n' + content
+        }));
+
+        // Aviso no texto do chat apontando para o(s) anexo(s).
+        const attachNote = files.length === 1
+            ? `(O conteúdo dos arquivos está no ANEXO "${files[0].name}" desta mensagem. ` +
+              `Leia-o inteiro antes de responder; os caminhos e o formato das respostas seguem as regras acima.)`
+            : `(O conteúdo dos arquivos está nos ${files.length} ANEXOS ` +
+              `"${files[0].name}" a "${files[files.length - 1].name}" desta mensagem. ` +
+              `Leia TODOS, na ordem, antes de responder; os caminhos e o formato das respostas seguem as regras acima.)`;
+
         return {
-            text: build(asFile ? ATTACH_NOTE : data),
-            fileText: asFile ? ('[CONTEXTO ATUAL DOS ARQUIVOS]\n' + data) : null,
-            // Fallback colado no campo: NUNCA acima de maxInlineChars (colar centenas de KB
-            // causava "Content is too long" e travava a aba).
-            inline: (limit) => build(truncateAtFile(data, limit))
+            text: rulesText + '\n\n' + attachNote,
+            files,
+            // Fallback (algum anexo falhou): cola inline truncado no limite do provider.
+            inline: (limit) => (kind === 'full'
+                ? buildFullPrompt({ tree, context: truncateAtFile(data, limit), question, fullCode })
+                : buildDeltaPrompt({ tree, changes: truncateAtFile(data, limit), question, fullCode }))
         };
     }
 
@@ -56,35 +138,56 @@
         p.setInput(input, text);
     }
 
-    const ATTACH_NAME = 'contexto-projeto.txt';
-
     async function deliverPrompt(input, composed) {
         const p = window.DS.getProvider();
-        if (composed.fileText) {
-            // Um anexo antigo ainda no campo: anexar de novo DUPLICARIA o contexto.
-            if (p.hasAttachmentChip && p.hasAttachmentChip(ATTACH_NAME)) {
-                window.DS.panel.toast('⚠️ Já existe um anexo "' + ATTACH_NAME + '" no campo. ' +
+
+        // Sem anexos: cola o texto direto (provider sem suporte a arquivo).
+        if (!composed.files || composed.files.length === 0) {
+            await setInputBig(input, composed.text);
+            return { attached: false };
+        }
+
+        // Já existe algum chip nosso no campo? Pede para remover antes de duplicar.
+        // (hasAttachmentChip usa o "stem" do nome — pega qualquer parte do split.)
+        for (const f of composed.files) {
+            if (p.hasAttachmentChip && p.hasAttachmentChip(f.name)) {
+                window.DS.panel.toast(`⚠️ Já existe um anexo "${f.name}" no campo. ` +
                     'Remova-o (×) ou envie a mensagem antes de anexar de novo.');
                 return { attached: false, aborted: true };
             }
-            window.DS.panel.toast('📎 Anexando o contexto como arquivo (evita travar o ' + window.DS.siteName() + ')...');
-            await setInputBig(input, composed.text);
-            await sleep(400); // deixa o editor processar antes de anexar
-            const ok = await p.attachTextFile(input, composed.fileText, ATTACH_NAME);
-            if (ok) return { attached: true };
-
-            // O upload pode ter terminado depois do timeout: confere de novo antes de duplicar.
-            await sleep(3000);
-            if (p.hasAttachmentChip && p.hasAttachmentChip(ATTACH_NAME)) return { attached: true };
-
-            const limit = p.maxInlineChars || 40000;
-            window.DS.panel.toast('⚠️ Não consegui anexar o arquivo. Colando uma versão reduzida (~' +
-                Math.round(limit / 1000) + ' KB). Para projetos grandes use "🎯 Seletivo".');
-            await setInputBig(input, composed.inline(limit));
-            return { attached: false };
         }
+
+        window.DS.panel.toast(composed.files.length === 1
+            ? `📎 Anexando "${composed.files[0].name}"...`
+            : `📎 Anexando ${composed.files.length} partes do contexto...`);
+
+        // Cola as regras (texto curto) no campo e anexa os pedaços em sequência.
         await setInputBig(input, composed.text);
-        return { attached: false };
+        await sleep(400);
+
+        let currentInput = p.findInput() || input;
+        for (let i = 0; i < composed.files.length; i++) {
+            const f = composed.files[i];
+            const ok = await p.attachTextFile(currentInput, f.content, f.name);
+            if (!ok) {
+                // O upload pode terminar depois do timeout: confere de novo.
+                await sleep(3000);
+                if (!(p.hasAttachmentChip && p.hasAttachmentChip(f.name))) {
+                        // ABORTA em vez de colar inline: se as partes 1..i-1 já estão
+                        // anexadas, colar o texto inteiro inline DUPLICARIA o contexto.
+                        window.DS.panel.toast(
+                            `⚠️ Falha ao anexar "${f.name}" (parte ${i + 1}/${composed.files.length}). ` +
+                            `Remova os anexos já feitos e tente de novo, ou use "🎯 Seletivo".`);
+                        return { attached: false, aborted: true };
+                }
+            }
+            // Pequeno intervalo para o editor processar cada upload.
+            if (i < composed.files.length - 1) await sleep(500);
+            // O DOM pode ter re-renderizado após o paste: busca o input de novo.
+            currentInput = p.findInput() || currentInput;
+        }
+
+        return { attached: true };
     }
 
     async function handleAttach(mode) {

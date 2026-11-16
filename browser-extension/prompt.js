@@ -253,3 +253,40 @@ function buildDeltaPrompt({ tree, changes, question, fullCode }) {
     parts.push(PROMPT_MARKER, question);
     return parts.join('\n');
 }
+
+// --- Versões SEM o contexto embutido -------------------------------------
+// Usadas quando o contexto vai em anexo(s) .txt. Mantêm regras + árvore +
+// pergunta no TEXTO do chat (curto e estável). O chamador acrescenta uma
+// nota de rodapé apontando para os anexos.
+
+function buildRulesOnlyFull({ tree, question, fullCode }) {
+    const parts = [
+        RESPONSE_RULES,
+        RE_RULES,
+        fullCode ? FULL_CODE_RULES : '',
+        '',
+        'Estrutura do projeto:',
+        FENCE,
+        tree || '(vazio)',
+        FENCE,
+        '',
+        PROMPT_MARKER,
+        question
+    ];
+    return parts.join('\n');
+}
+
+function buildRulesOnlyDelta({ tree, question, fullCode }) {
+    const parts = ['[ATUALIZAÇÃO DO PROJETO]', DELTA_REMINDER, ''];
+    if (fullCode) parts.push(FULL_CODE_RULES, '');
+    if (tree) {
+        parts.push('A estrutura do projeto mudou. Estrutura atual:', FENCE, tree, FENCE, '');
+    }
+    parts.push(
+        'Arquivos alterados/removidos desde o contexto anterior desta conversa estão no(s) anexo(s) .txt abaixo.',
+        '',
+        PROMPT_MARKER,
+        question
+    );
+    return parts.join('\n');
+}

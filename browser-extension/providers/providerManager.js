@@ -79,16 +79,36 @@
     // contra o que já existia, tenta UM método por vez e nunca anexa duas vezes.
     // ---------------------------------------------------------------------
     function _stemOf(name) { return String(name).slice(0, 10); }
+    // Stem do nome completo (sem extensão). Distingue partes de split:
+    // "contexto-projeto-1-de-3.txt" ≠ "contexto-projeto-2-de-3.txt".
+    function _exactStemOf(name) { return String(name).replace(/\.[^.]+$/, ''); }
 
-    /** Quantos textos visíveis (fora do campo de entrada) mostram esse nome de arquivo. */
-    function countFileChips(name, input) {
-        const stem = _stemOf(name);
+    /**
+     * Área que contém o CAMPO e os CHIPS de anexo — NÃO a conversa inteira.
+     *
+     * Sem esse escopo, `countFileChips` acha chips de mensagens antigas e:
+     *   - bloqueia re-anexar contexto ("já existe anexo no campo");
+     *   - confunde parts do split (stem `contexto-p` casa com tudo).
+     *
+     * Usamos, em ordem: <form> ancestral, ou 3 níveis acima do campo (composer).
+     */
+    function findChipScope(input) {
+        if (!input) return document.body;
+        const form = input.closest('form');
+        if (form) return form;
+        let el = input;
+        for (let i = 0; i < 3 && el.parentElement; i++) el = el.parentElement;
+        return el;
+    }
+
+    function _walkCount(root, input, needle) {
+        if (!needle) return 0;
         let n = 0;
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
         let node;
         while ((node = walker.nextNode())) {
             const t = node.nodeValue;
-            if (!t || t.length > 200 || t.indexOf(stem) === -1) continue;
+            if (!t || t.length > 200 || t.indexOf(needle) === -1) continue;
             const el = node.parentElement;
             if (!el) continue;
             if (el.closest('#ds-sync-root')) continue;
@@ -97,6 +117,24 @@
             n++;
         }
         return n;
+    }
+
+    /**
+     * Conta chips pelo prefixo (10 chars). Usado pelo `attachFileOnce` para
+     * detectar "apareceu UM chip novo?" — funciona mesmo se o site truncar
+     * o nome exibido.
+     */
+    function countFileChips(name, input) {
+        return _walkCount(findChipScope(input), input, _stemOf(name));
+    }
+
+    /**
+     * Conta chips pelo NOME COMPLETO (sem extensão). Distingue parts do split:
+     * parte 1 (`contexto-projeto-1-de-3`) não casa com parte 2 (`-2-de-3`).
+     * Usado por `hasAttachmentChip` para o "já existe?".
+     */
+    function countFileChipsExact(name, input) {
+        return _walkCount(findChipScope(input), input, _exactStemOf(name));
     }
 
     async function _waitChipDelta(name, input, baseline, ms) {
@@ -154,6 +192,8 @@
     }
 
     window.DS.countFileChips = countFileChips;
+    window.DS.countFileChipsExact = countFileChipsExact;
+    window.DS.findChipScope = findChipScope;
     window.DS.attachFileOnce = attachFileOnce;
     window.DS.findTooLongNotice = findTooLongNotice;
 

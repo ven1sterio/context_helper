@@ -211,9 +211,13 @@
         }
 
 
-        /** Há um chip de anexo mostrando esse nome de arquivo? (detecção por texto, não por classe CSS) */
+        /** Mesmo esquema do DeepSeek: match exato, fallback só para não-partes. */
         hasAttachmentChip(name) {
-            return window.DS.countFileChips(name, this.findInput()) > 0;
+            const input = this.findInput();
+            if (window.DS.countFileChipsExact(name, input) > 0) return true;
+            const isSplitPart = /-de-\d+\.txt$/i.test(name);
+            if (!isSplitPart && window.DS.countFileChips(name, input) > 0) return true;
+            return false;
         }
 
         /** Anexa o texto como arquivo. Um método por vez, sem duplicar. */

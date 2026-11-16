@@ -92,9 +92,18 @@ class DeepSeekProvider {
     }
 
 
-    /** Há um chip de anexo mostrando esse nome de arquivo? (detecção por texto, não por classe CSS) */
+    /**
+     * Há um chip desse arquivo ESPECÍFICO na área do campo?
+     * Usa match exato (nome completo sem extensão) para distinguir partes do
+     * split. Se o chip for truncado pelo site, cai no prefixo — mas SÓ quando
+     * não é parte de split (`-i-de-N.txt`), senão parte 1 bloquearia parte 2.
+     */
     hasAttachmentChip(name) {
-        return window.DS.countFileChips(name, this.findInput()) > 0;
+        const input = this.findInput();
+        if (window.DS.countFileChipsExact(name, input) > 0) return true;
+        const isSplitPart = /-de-\d+\.txt$/i.test(name);
+        if (!isSplitPart && window.DS.countFileChips(name, input) > 0) return true;
+        return false;
     }
 
     /** Anexa o texto como arquivo. Um método por vez, sem duplicar. */
