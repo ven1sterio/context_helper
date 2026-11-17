@@ -23,7 +23,8 @@
         newChatUrl: null,
         supportsFileAttach: false,
         maxInlineChars: 40000,
-        maxContextChars: 150000
+        maxContextChars: 150000,
+        maxAttachChars: 250000
     };
 
     function getProvider() {

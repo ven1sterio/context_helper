@@ -20,26 +20,51 @@
     // Teto de partes por envio (evita 50 anexos num projeto gigante).
     const MAX_PARTS = 10;
 
+    /** Caminhos dos blocos "--- arquivo ---" presentes em `text` (para avisar o que ficou de fora). */
+    function listFileBlocks(text) {
+        const out = [];
+        const re = /^--- (?:BINÁRIO \(PE\): |ALTERADO: |REMOVIDO: )?(.+?) ---$/gm;
+        let m;
+        while ((m = re.exec(text)) !== null) out.push(m[1]);
+        return out;
+    }
+
     /**
      * Quebra o texto do contexto em pedaços BALANCEADOS (targetSize = total/N),
-     * preferindo cortar no início de um bloco "--- arquivo ---". Cap em
-     * MAX_PARTS: acima disso, trunca com aviso. Assim, um contexto de 100 KB
-     * com maxChars=40 KB vira 3 partes de ~33 KB — não 2 cheias + 1 resíduo.
+     * preferindo cortar no início de um bloco "--- arquivo ---". Cap em MAX_PARTS
+     * (limite de anexos por mensagem dos chats). Se mesmo assim estourar, o aviso
+     * LISTA os arquivos que ficaram de fora — nada some em silêncio.
      */
     function splitContext(data, maxChars) {
         if (!data || data.length <= maxChars) return [data || ''];
-        const minChunks = Math.ceil(data.length / maxChars);
+        // 5% de folga: cortar no início de um bloco encurta cada parte um pouco, e sem folga
+        // o resto vazaria para uma parte extra (passando de MAX_PARTS).
+        const usable = Math.floor(maxChars * 0.95);
+        const minChunks = Math.ceil(data.length / usable);
         if (minChunks > MAX_PARTS) {
-            const truncated = data.slice(0, maxChars * MAX_PARTS) +
-                `\n\n[CONTEXTO TRUNCADO: ${data.length} chars excede ${MAX_PARTS} × ${maxChars}. ` +
-                `Use "🎯 Seletivo" para focar em arquivos específicos.]\n`;
+            // Reserva espaço para o próprio aviso caber dentro das MAX_PARTS partes.
+            const limit = usable * MAX_PARTS - 8000;
+            let cut = data.lastIndexOf('\n--- ', limit);
+            if (cut < limit / 2) cut = limit;
+            const kept = data.slice(0, cut);
+            const dropped = listFileBlocks(data.slice(cut));
+            let names = dropped.join(', ');
+            if (names.length > 6000) names = names.slice(0, 6000) + ` … (lista cortada; ${dropped.length} no total)`;
+            const truncated = kept +
+                `\n\n[CONTEXTO TRUNCADO: ${data.length} caracteres excedem ${MAX_PARTS} anexos de ${maxChars}. ` +
+                `NÃO enviados (${dropped.length}): ${names}. ` +
+                `Peça esses arquivos pelo nome ou use "🎯 Seletivo".]\n`;
+            if (window.DS && window.DS.panel && window.DS.panel.toast) {
+                window.DS.panel.toast(`⚠️ O projeto não coube em ${MAX_PARTS} anexos: ${dropped.length} arquivo(s) ficaram de fora (listados no fim do último anexo).`);
+            }
             return splitContext(truncated, maxChars);
         }
         const targetSize = Math.ceil(data.length / minChunks);
         const chunks = [];
         let remaining = data;
         while (remaining.length > 0) {
-            if (remaining.length <= targetSize) {
+            // A última parte leva o que sobrar: o número de partes é sempre minChunks.
+            if (remaining.length <= targetSize || chunks.length === minChunks - 1) {
                 chunks.push(remaining);
                 break;
             }
@@ -69,6 +94,8 @@
         const p = window.DS.getProvider();
         const supportsFiles = !!(p.supportsFileAttach && p.attachTextFile);
         const maxChars = p.maxInlineChars || 40000;
+        // Cada ANEXO pode ser bem maior que o que dá para colar no campo.
+        const attachChars = p.maxAttachChars || 250000;
 
         // Provider sem anexo (ou contexto vazio): cai no modo antigo (tudo inline).
         if (!supportsFiles || !data || data.length === 0) {
@@ -89,7 +116,7 @@
 
         // CONTEXTO vai em 1+ anexos .txt. Se precisar dividir, cada parte
         // ganha um cabeçalho "parte i de N".
-        const chunks = splitContext(data, maxChars);
+        const chunks = splitContext(data, attachChars);
         const files = chunks.map((content, i) => ({
             name: attachNameFor(i, chunks.length),
             content: headerFor(kind, i, chunks.length) + '\n' + content
@@ -238,6 +265,11 @@
                 conn.nextIsDelta = true;
                 let info = `Contexto completo: ${msg.files} arquivo(s), ${kb} KB.`;
                 if (msg.omitted > 0) info += ` ${msg.omitted} omitido(s) por limite de tamanho.`;
+                const softLimit = p.maxContextChars || 0;
+                if (softLimit && msg.chars > softLimit) {
+                    info += ` ⚠️ Passa de ~${Math.round(softLimit / 1024)} KB, o que este chat costuma aceitar. ` +
+                        'Se ele acusar "too long", use "🎯 Seletivo".';
+                }
                 window.DS.panel.toast(info);
             } else {
                 const r = await deliverPrompt(input, composePrompt('delta', { tree: msg.tree, data: msg.data, question, fullCode: false }));
