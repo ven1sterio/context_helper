@@ -7,7 +7,7 @@ import { TaskRunner } from './taskRunner';
 import { Indexer } from './indexer';
 import { GraphStore } from './graphStore';
 import { StateManager } from './stateManager';
-import { setAllowSensitive, maskSecrets } from './pathRules';
+import { setAllowSensitive, setExtraExcludedDirs, maskSecrets } from './pathRules';
 import { PlanManager } from './agent/planManager';
 import { TaskQueue } from './agent/taskQueue';
 import { RunManager } from './agent/runManager';
@@ -75,6 +75,9 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
 
     setAllowSensitive(
         vscode.workspace.getConfiguration('deepseekContextSync').get<boolean>('allowSensitiveFiles', false)
+    );
+    setExtraExcludedDirs(
+        vscode.workspace.getConfiguration('deepseekContextSync').get<string[]>('extraExcludedDirs', [])
     );
 
     let token = context.globalState.get<string>(TOKEN_KEY);
@@ -349,6 +352,14 @@ async function activateSteps(context: vscode.ExtensionContext, isTimedOut: () =>
     const cfgSub = vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration('deepseekContextSync.graphPath')) {
             graphStore.setPath(vscode.workspace.getConfiguration('deepseekContextSync').get<string>('graphPath', 'graphify-out/graph.json'));
+        }
+        if (e.affectsConfiguration('deepseekContextSync.extraExcludedDirs')) {
+            setExtraExcludedDirs(
+                vscode.workspace.getConfiguration('deepseekContextSync').get<string[]>('extraExcludedDirs', [])
+            );
+            void vscode.window.showInformationMessage(
+                'DeepSeek Context Sync: as pastas excluídas mudaram. Recarregue a janela (Developer: Reload Window) para reindexar.'
+            );
         }
         if (e.affectsConfiguration('deepseekContextSync.allowSensitiveFiles')) {
             setAllowSensitive(

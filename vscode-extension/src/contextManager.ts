@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { EXCLUDED_DIRS, isExcludedPath, isProbablyBinary, isInspectableBinary } from './pathRules';
+import { EXCLUDED_DIRS, isExcludedPath, isProbablyBinary, isInspectableBinary, looksGeneratedContent } from './pathRules';
 import { ContextBudget } from './intelligence/contextBudget';
 import { IndexData } from './indexer';
 import { parsePE, formatPEInfo } from './peInspector';
@@ -78,16 +78,18 @@ export interface DeltaResult {
 }
 
 const MAX_FILES_SCAN = 20000;
-const MAX_TREE_LINES = 2000;
+const MAX_TREE_LINES = 20000;
 
 interface TreeNode {
     dirs: Map<string, TreeNode>;
-    files: string[];
+    files: { name: string; rel: string }[];
 }
 
 export class ContextManager {
     private files = new Map<string, string>();
     private binaries = new Map<string, string>();
+    /** rel → motivo pelo qual o arquivo aparece na árvore mas seu conteúdo NÃO é enviado. */
+    private skipped = new Map<string, string>();
     private decompileCache = new Map<string, { hash: string; block: string }>();
     private binaryHash = new Map<string, string>();
     private decompileLimiter = new Limiter(2);
@@ -124,6 +126,15 @@ export class ContextManager {
     private get maxTotalChars(): number {
         const kb = vscode.workspace.getConfiguration('deepseekContextSync').get<number>('maxTotalKB', 200);
         return kb * 1024;
+    }
+
+    /**
+     * true (padrão): o contexto completo NÃO tem teto de tamanho — tudo que não é
+     * ruído (node_modules, build, gerados, lockfiles) é enviado e o navegador
+     * reparte em vários anexos. false: volta ao comportamento antigo (maxTotalKB).
+     */
+    get sendAllContext(): boolean {
+        return vscode.workspace.getConfiguration('deepseekContextSync').get<boolean>('sendAllContext', true);
     }
 
     /** Teto efetivo: o menor entre a configuração e o limite informado pelo navegador (por provedor). */
@@ -262,6 +273,7 @@ export class ContextManager {
             const inspectable = this.inspectBinariesEnabled && isInspectableBinary(rel);
             const sizeLimit = inspectable ? this.maxBinaryBytes : this.maxFileBytes;
             if (stat.size > sizeLimit) {
+                this.skipped.set(rel, `grande demais: ${Math.round(stat.size / 1024)} KB > limite de ${Math.round(sizeLimit / 1024)} KB`);
                 this.removeFile(rel, notify);
                 if (this.binaries.delete(rel) && notify) {
                     this._onDidChange.fire({ relPath: rel, kind: 'changed' });
@@ -271,6 +283,7 @@ export class ContextManager {
 
             const bytes = await vscode.workspace.fs.readFile(uri);
             if (!isProbablyBinary(bytes) && stat.size > this.maxFileBytes) {
+                this.skipped.set(rel, `grande demais: ${Math.round(stat.size / 1024)} KB > limite de ${Math.round(this.maxFileBytes / 1024)} KB`);
                 this.removeFile(rel, notify);
                 return;
             }
@@ -281,6 +294,7 @@ export class ContextManager {
                         const info = parsePE(Buffer.from(bytes));
                         if (info) {
                             const summary = formatPEInfo(info, rel);
+                            this.skipped.delete(rel);
                             this.binaryHash.set(rel, info.hash);
                             const cached = this.decompileCache.get(rel);
                             const useCache = cached && cached.hash === info.hash;
@@ -297,6 +311,7 @@ export class ContextManager {
                         }
                     } catch { /* parser falhou: cai para o comportamento antigo */ }
                 }
+                this.skipped.set(rel, 'binário (conteúdo não enviado)');
                 if (this.binaries.delete(rel) && notify) {
                     this._onDidChange.fire({ relPath: rel, kind: 'changed' });
                 }
@@ -306,6 +321,16 @@ export class ContextManager {
             this.binaries.delete(rel);
 
             const content = Buffer.from(bytes).toString('utf8');
+
+            // Gerado por ferramenta / minificado: não é fonte. Some do contexto E da árvore,
+            // para o modelo não achar que "faltam" arquivos que o build recria.
+            if (looksGeneratedContent(rel, content)) {
+                this.skipped.delete(rel);
+                this.removeFile(rel, notify);
+                this.removePath(rel, notify);
+                return;
+            }
+            this.skipped.delete(rel);
             if (this.files.get(rel) === content) return;
 
             this.files.set(rel, content);
@@ -513,6 +538,7 @@ export class ContextManager {
         const rel = this.toRel(uri);
         if (!rel) return;
         this.removeFile(rel, true);
+        this.skipped.delete(rel);
         this.binaries.delete(rel);
         this.decompileCache.delete(rel);
         this.binaryHash.delete(rel);
@@ -520,6 +546,9 @@ export class ContextManager {
         if (this.decompileJobs.delete(rel)) this.emitDecompileProgress();
         this.removePath(rel, true);
         const prefix = rel + '/';
+        for (const key of [...this.skipped.keys()]) {
+            if (key.startsWith(prefix)) this.skipped.delete(key);
+        }
         for (const key of [...this.files.keys()]) {
             if (key.startsWith(prefix)) this.removeFile(key, true);
         }
@@ -556,7 +585,7 @@ export class ContextManager {
                 }
                 node = next;
             }
-            node.files.push(parts[parts.length - 1]);
+            node.files.push({ name: parts[parts.length - 1], rel: p });
         }
 
         const lines: string[] = [];
@@ -566,7 +595,10 @@ export class ContextManager {
                 lines.push(`${indent}${name}/`);
                 render(node.dirs.get(name)!, depth + 1);
             }
-            for (const f of node.files.sort()) lines.push(indent + f);
+            for (const f of node.files.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+                const why = this.skipped.get(f.rel);
+                lines.push(indent + f.name + (why ? `  [conteúdo NÃO enviado: ${why}]` : ''));
+            }
         };
         render(root, 0);
 
@@ -590,38 +622,55 @@ export class ContextManager {
         return lines.join('\n');
     }
 
+    /** Texto do manifesto: diz ao modelo, sem ambiguidade, o que foi e o que não foi enviado. */
+    private buildManifest(included: number, omitted: string[], capped: boolean): string {
+        const lines: string[] = ['', '[MANIFESTO DO CONTEXTO]'];
+        lines.push(`Arquivos incluídos integralmente: ${included}.`);
+        if (omitted.length === 0 && this.skipped.size === 0) {
+            lines.push('NENHUM arquivo do projeto foi omitido. Pastas de dependências/build/código gerado ' +
+                '(node_modules, dist, .next, .prisma, lockfiles etc.) ficam de fora de propósito porque são recriadas pelo build.');
+            return lines.join('\n') + '\n';
+        }
+        if (omitted.length > 0) {
+            lines.push(`Omitidos por limite de tamanho (${omitted.length}): ${omitted.slice(0, 200).join(', ')}` +
+                (omitted.length > 200 ? ` … (+${omitted.length - 200})` : ''));
+            if (capped) lines.push('Ative "deepseekContextSync.sendAllContext" para enviar tudo.');
+        }
+        if (this.skipped.size > 0) {
+            const list = [...this.skipped.entries()].sort(([a], [b]) => a < b ? -1 : 1).slice(0, 100);
+            lines.push(`Presentes no projeto, mas sem conteúdo enviado (${this.skipped.size}):`);
+            for (const [rel, why] of list) lines.push(`  - ${rel} (${why})`);
+            if (this.skipped.size > list.length) lines.push(`  … (+${this.skipped.size - list.length})`);
+        }
+        lines.push('Todo o resto do projeto foi incluído. Se precisar de um arquivo listado acima, peça pelo nome.');
+        return lines.join('\n') + '\n';
+    }
+
     buildFull(maxCharsOverride?: number): FullResult {
-        const max = this.effectiveMaxChars(maxCharsOverride);
-        let text = '';
+        const capped = !this.sendAllContext;
+        const max = capped ? this.effectiveMaxChars(maxCharsOverride) : Number.POSITIVE_INFINITY;
+        const parts: string[] = [];
+        let size = 0;
         let files = 0;
         const omitted: string[] = [];
 
-        for (const rel of [...this.files.keys()].sort()) {
-            const block = `\n--- ${rel} ---\n${this.files.get(rel)}\n`;
-            if (text.length + block.length > max) {
-                omitted.push(rel);
-                continue;
-            }
-            text += block;
+        const push = (rel: string, block: string) => {
+            if (size + block.length > max) { omitted.push(rel); return; }
+            parts.push(block);
+            size += block.length;
             files++;
-        }
+        };
 
+        for (const rel of [...this.files.keys()].sort()) {
+            push(rel, `\n--- ${rel} ---\n${this.files.get(rel)}\n`);
+        }
         for (const rel of [...this.binaries.keys()].sort()) {
             const summary = this.binaries.get(rel);
             if (!summary) continue;
-            const block = `\n--- BINÁRIO (PE): ${rel} ---\n${summary}\n`;
-            if (text.length + block.length > max) {
-                omitted.push(rel);
-                continue;
-            }
-            text += block;
-            files++;
+            push(rel, `\n--- BINÁRIO (PE): ${rel} ---\n${summary}\n`);
         }
 
-        if (omitted.length > 0) {
-            text += `\n[Omitidos por limite de tamanho (${omitted.length}): ${omitted.slice(0, 80).join(', ')}]\n`;
-            text += `[Aumente "deepseekContextSync.maxTotalKB" nas configurações se precisar enviar mais arquivos.]\n`;
-        }
+        const text = parts.join('') + this.buildManifest(files, omitted, capped);
         return { text, files, chars: text.length, omitted };
     }
 
@@ -632,12 +681,29 @@ export class ContextManager {
         let used = result.totalTokens;
         let text = '';
         let files = 0;
+        const placed = new Set<string>();
         for (const f of ordered) {
             const content = this.files.get(f.path);
             if (content === undefined) continue;
             text += `\n--- ${f.path} ---\n${content}\n`;
+            placed.add(f.path);
             files++;
         }
+
+        // Arquivos que o ContextManager tem mas o índice ainda não conhece (índice
+        // atrasado) eram descartados em silêncio. Agora entram, ou são listados como omitidos.
+        const unindexed: string[] = [];
+        const omittedSet = new Set(omitted);
+        for (const rel of [...this.files.keys()].sort()) {
+            if (placed.has(rel) || omittedSet.has(rel)) continue;
+            const block = `\n--- ${rel} ---\n${this.files.get(rel)}\n`;
+            const est = Math.ceil(block.length / 4);
+            if (used + est > maxTokens) { unindexed.push(rel); continue; }
+            text += block;
+            files++;
+            used += est;
+        }
+        omitted.push(...unindexed);
 
         const binOmitted: string[] = [];
         for (const rel of [...this.binaries.keys()].sort()) {
@@ -655,10 +721,7 @@ export class ContextManager {
         }
 
         const allOmitted = [...omitted, ...binOmitted];
-        if (allOmitted.length > 0) {
-            text += `\n[Omitidos por orçamento (${allOmitted.length}): ${allOmitted.slice(0, 80).join(', ')}]\n`;
-            text += `[Aumente "deepseekContextSync.maxContextTokens" ou "maxTotalKB" para incluir mais.]\n`;
-        }
+        text += this.buildManifest(files, allOmitted, true);
         return { text, files, chars: text.length, omitted: allOmitted };
     }
 

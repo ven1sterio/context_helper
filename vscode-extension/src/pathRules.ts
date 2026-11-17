@@ -17,6 +17,13 @@ export const EXCLUDED_DIRS = new Set([
     '.turbo', '.vercel', '.cache', '.parcel-cache', '.swc', '.svelte-kit',
     '.angular', '.docusaurus', '.expo', '.gradle', '.mvn', '.yarn',
     'bower_components', 'tmp', 'temp',
+    // Saídas que só existem depois de build/generate/install (nunca são fonte):
+    // Prisma client gerado (.prisma), Nuxt/Nitro, Vite, Wrangler, Storybook etc.
+    '.prisma', '.output', '.nitro', '.vite', '.wrangler', '.sst', '.serverless',
+    '.terraform', '.dart_tool', 'Pods', 'DerivedData', '.nyc_output',
+    'storybook-static', '.pnpm-store', '.npm', 'jspm_packages',
+    '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox', '.eggs',
+    '__generated__', '.history',
     // Configs/instruções de ferramentas de IA (skills, regras, prompts):
     // costumam ser volumosas, não são código do projeto e poluem o contexto.
     // Mantê-las aqui as exclui do envio, da tree, do watcher e da escrita.
@@ -114,11 +121,94 @@ export function isSensitiveName(name: string): boolean {
     return looksSensitive(name);
 }
 
+/**
+ * Sequências de pastas que só existem depois de `prisma generate` / codegen.
+ * O nome isolado ("generated") é comum em código escrito à mão, então só as
+ * combinações abaixo são tratadas como saída gerada.
+ */
+const GENERATED_DIR_SEQUENCES: string[][] = [
+    ['generated', 'prisma'],
+    ['prisma', 'generated'],
+    ['generated', 'client'],
+    ['@prisma', 'client'],
+];
+
+/** Lockfiles: enormes, sem valor para o modelo e regenerados pelo gerenciador de pacotes. */
+const NOISE_FILE_NAMES = new Set([
+    'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml',
+    'bun.lockb', 'bun.lock', 'composer.lock', 'cargo.lock', 'poetry.lock',
+    'pipfile.lock', 'gemfile.lock', 'go.sum', 'pubspec.lock', 'flake.lock',
+    '.ds_store', 'thumbs.db'
+]);
+
+/** Artefatos de build que podem ficar ao lado do código-fonte. */
+const NOISE_SUFFIXES = ['.min.js', '.min.css', '.map', '.tsbuildinfo', '.pyc', '.class'];
+
+function hasDirSequence(dirs: string[], seq: string[]): boolean {
+    for (let i = 0; i + seq.length <= dirs.length; i++) {
+        let ok = true;
+        for (let j = 0; j < seq.length; j++) {
+            if (dirs[i + j] !== seq[j]) { ok = false; break; }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+/** Pastas adicionais definidas pelo usuário (deepseekContextSync.extraExcludedDirs). */
+let extraExcluded: string[] = [];
+export function setExtraExcludedDirs(list: string[]) {
+    extraExcluded = (list || [])
+        .map(s => String(s).trim().replace(/^\.?\//, '').replace(/\/+$/, ''))
+        .filter(Boolean);
+}
+
+function matchesExtra(rel: string): boolean {
+    for (const pat of extraExcluded) {
+        // "foo" = qualquer pasta/arquivo chamado foo; "a/b" = caminho a partir da raiz
+        if (pat.includes('/')) {
+            if (rel === pat || rel.startsWith(pat + '/')) return true;
+        } else if (rel.split('/').includes(pat)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Saída de build/geração, dependência ou lockfile: nunca entra no contexto. */
+export function isNoisePath(rel: string): boolean {
+    const parts = rel.split('/');
+    const name = parts[parts.length - 1];
+    const lower = name.toLowerCase();
+    if (NOISE_FILE_NAMES.has(lower)) return true;
+    if (NOISE_SUFFIXES.some(sfx => lower.endsWith(sfx))) return true;
+    const dirs = parts.slice(0, -1);
+    return GENERATED_DIR_SEQUENCES.some(seq => hasDirSequence(dirs, seq));
+}
+
+/**
+ * O conteúdo se declara gerado por ferramenta? (Go "Code generated ... DO NOT EDIT",
+ * "@generated", cabeçalhos de codegen) ou é JS/CSS minificado? Só olha o começo
+ * do arquivo, então é barato. Usado apenas para CONTEXTO, nunca para escrita.
+ */
+export function looksGeneratedContent(rel: string, text: string): boolean {
+    const head = text.slice(0, 600);
+    if (/@generated\b|\bDO NOT EDIT\b|\bCode generated\b|\bauto-?generated (?:by|file)\b/i.test(head)) return true;
+    if (/\.(?:m?js|cjs|css)$/i.test(rel) && text.length > 8000) {
+        const lines = text.split('\n').length;
+        if (text.length / lines > 400) return true; // minificado
+    }
+    return false;
+}
+
 /** rel: caminho relativo com "/" (ex.: "src/main.py"). Usado para CONTEXTO (leitura). */
 export function isExcludedPath(rel: string): boolean {
     const parts = rel.split('/');
     const name = parts[parts.length - 1];
-    return parts.slice(0, -1).some(d => EXCLUDED_DIRS.has(d)) || isSensitiveName(name);
+    return parts.slice(0, -1).some(d => EXCLUDED_DIRS.has(d))
+        || isSensitiveName(name)
+        || isNoisePath(rel)
+        || matchesExtra(rel);
 }
 
 /**

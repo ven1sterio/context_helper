@@ -355,7 +355,7 @@ export class WsServer {
 
                             const useBudget = vscode.workspace.getConfiguration('deepseekContextSync')
                                 .get<boolean>('useContextBudget', true);
-                            const r = (useBudget && this.indexer)
+                            const r = (useBudget && !this.contextManager.sendAllContext && this.indexer)
                                 ? this.contextManager.buildFullWithBudget(this.fullBudgetTokens(maxChars), this.indexer.getIndex())
                                 : this.contextManager.buildFull(maxChars);
 
