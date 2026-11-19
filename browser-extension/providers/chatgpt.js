@@ -76,6 +76,8 @@
             // Teto do contexto enviado por este site (o servidor usa o menor entre este e maxTotalKB).
             this.maxContextChars = 200000;
             this.maxAttachChars = 250000;
+            this.maxMessageChars = 2500000;
+            this.maxFilesPerMessage = 10;
             this.supportsFileAttach = true;
         }
 

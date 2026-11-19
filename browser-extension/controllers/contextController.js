@@ -17,8 +17,9 @@
         return `${ATTACH_NAME_BASE}-${index + 1}-de-${total}.txt`;
     }
 
-    // Teto de partes por envio (evita 50 anexos num projeto gigante).
-    const MAX_PARTS = 10;
+    // Teto de partes no total (o envio é repartido em vários lotes/mensagens, então
+    // este limite não é mais o de "anexos por mensagem").
+    const MAX_PARTS = 40;
 
     /** Caminhos dos blocos "--- arquivo ---" presentes em `text` (para avisar o que ficou de fora). */
     function listFileBlocks(text) {
@@ -122,22 +123,61 @@
             content: headerFor(kind, i, chunks.length) + '\n' + content
         }));
 
-        // Aviso no texto do chat apontando para o(s) anexo(s).
-        const attachNote = files.length === 1
-            ? `(O conteúdo dos arquivos está no ANEXO "${files[0].name}" desta mensagem. ` +
+        // Agrupa os anexos em MENSAGENS: cada chat só lê bem uma quantidade limitada por mensagem
+        // (o DeepSeek avisa "Length limit reached... first 5%" quando passa disso).
+        const batches = packBatches(files, p.maxMessageChars || Infinity, p.maxFilesPerMessage || 10);
+        const last = batches[batches.length - 1];
+        const total = batches.length;
+
+        const nameOf = (list) => list.length === 1
+            ? `"${list[0].name}"`
+            : `"${list[0].name}" a "${list[list.length - 1].name}"`;
+
+        let attachNote = last.length === 1
+            ? `(O conteúdo dos arquivos está no ANEXO ${nameOf(last)} desta mensagem. ` +
               `Leia-o inteiro antes de responder; os caminhos e o formato das respostas seguem as regras acima.)`
-            : `(O conteúdo dos arquivos está nos ${files.length} ANEXOS ` +
-              `"${files[0].name}" a "${files[files.length - 1].name}" desta mensagem. ` +
+            : `(O conteúdo dos arquivos está nos ${last.length} ANEXOS ${nameOf(last)} desta mensagem. ` +
               `Leia TODOS, na ordem, antes de responder; os caminhos e o formato das respostas seguem as regras acima.)`;
+        if (total > 1) {
+            attachNote = `(MENSAGEM FINAL, ${total} de ${total}. O contexto do projeto foi enviado em ${total} mensagens: ` +
+                `os lotes 1 a ${total - 1} estão nas mensagens ANTERIORES desta conversa e este é o último. ` +
+                `Considere TODOS os anexos (partes 1 a ${files.length}) como o contexto completo.) ` + attachNote;
+        }
+
+        // Mensagens que vão ANTES da final: só contexto, resposta curta.
+        const preBatches = batches.slice(0, -1).map((list, i) => ({
+            text: `[CONTEXTO DO PROJETO EM LOTES — mensagem ${i + 1} de ${total}]\n` +
+                `Por causa do limite de leitura do chat, estou enviando o código em ${total} mensagens. ` +
+                `Leia o(s) anexo ${nameOf(list)} desta mensagem, guarde o conteúdo e responda SOMENTE "OK ${i + 1}/${total}". ` +
+                `Não analise nem comece a tarefa agora: ela vem na última mensagem.`,
+            files: list
+        }));
 
         return {
             text: rulesText + '\n\n' + attachNote,
-            files,
+            files: last,
+            preBatches,
             // Fallback (algum anexo falhou): cola inline truncado no limite do provider.
             inline: (limit) => (kind === 'full'
                 ? buildFullPrompt({ tree, context: truncateAtFile(data, limit), question, fullCode })
                 : buildDeltaPrompt({ tree, changes: truncateAtFile(data, limit), question, fullCode }))
         };
+    }
+
+    /** Agrupa anexos em mensagens respeitando o total de caracteres e o nº de arquivos por mensagem. */
+    function packBatches(files, maxMessageChars, maxFiles) {
+        const batches = [[]];
+        let size = 0;
+        for (const f of files) {
+            const cur = batches[batches.length - 1];
+            if (cur.length > 0 && (size + f.content.length > maxMessageChars || cur.length >= maxFiles)) {
+                batches.push([]);
+                size = 0;
+            }
+            batches[batches.length - 1].push(f);
+            size += f.content.length;
+        }
+        return batches;
     }
 
     /** Corta `data` no limite, preferindo o início de um bloco "--- arquivo ---". */
@@ -165,7 +205,40 @@
         p.setInput(input, text);
     }
 
+    // Mensagens de contexto que ainda faltam enviar (modo manual). O botão "Anexar" entrega a próxima.
+    let pendingQueue = [];
+
     async function deliverPrompt(input, composed) {
+        const pre = composed.preBatches || [];
+        if (pre.length === 0) { pendingQueue = []; return deliverSingle(input, composed); }
+
+        // Modo manual: entrega a 1ª mensagem agora e guarda as demais.
+        const queue = [...pre, { text: composed.text, files: composed.files }];
+        const r = await deliverSingle(input, queue[0]);
+        if (r.aborted) { pendingQueue = []; return r; }
+        pendingQueue = queue.slice(1);
+        window.DS.panel.toast(`📦 Contexto em ${queue.length} mensagens (limite de leitura do chat). ` +
+            `Enviei a 1/${queue.length} no campo: ENVIE e espere o "OK"; depois clique em Anexar de novo para a próxima.`);
+        return { attached: true, batched: true, remaining: pendingQueue.length };
+    }
+
+    async function deliverNextPending(input) {
+        const p = window.DS.getProvider();
+        if (p.readInput(input).trim().length > 0) {
+            window.DS.panel.toast('Envie a mensagem que está no campo antes de pedir o próximo lote.');
+            return;
+        }
+        const next = pendingQueue[0];
+        const r = await deliverSingle(input, next);
+        if (r.aborted) return;
+        pendingQueue.shift();
+        window.DS.panel.toast(pendingQueue.length > 0
+            ? `📦 Lote entregue no campo. Faltam ${pendingQueue.length} depois deste: envie, espere o "OK" e clique em Anexar.`
+            : '✅ Último lote no campo (com as regras e o seu pedido). Envie.');
+        window.DS.panel.refresh();
+    }
+
+    async function deliverSingle(input, composed) {
         const p = window.DS.getProvider();
 
         // Sem anexos: cola o texto direto (provider sem suporte a arquivo).
@@ -234,6 +307,12 @@
         const p = window.DS.getProvider();
         const input = p.findInput();
         if (!input) { window.DS.panel.toast('Campo de entrada não encontrado.'); return; }
+
+        if (pendingQueue.length > 0) {
+            busyAttach = true;
+            try { await deliverNextPending(input); } finally { busyAttach = false; }
+            return;
+        }
 
         const current = p.readInput(input);
         if (current.includes(PROMPT_MARKER)) {
@@ -448,6 +527,8 @@
 
     window.DS.context = {
         composePrompt,
+        packBatches,
+        splitContext,
         deliverPrompt,
         setInputBig,
         handleAttach,

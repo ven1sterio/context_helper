@@ -62,9 +62,14 @@ class DeepSeekProvider {
         // ARQUIVO anexo — colar centenas de KB no campo do chat trava a aba.
         this.maxInlineChars = 40000;
         // Teto do contexto enviado por este site (o servidor usa o menor entre este e maxTotalKB).
-        this.maxContextChars = 150000;
-        // Tamanho de cada anexo .txt quando o contexto é repartido (≠ limite de colagem inline).
-        this.maxAttachChars = 250000;
+        // Aviso (não corte): acima disso o contexto tende a passar da janela do modelo.
+        this.maxContextChars = 350000;
+        // O DeepSeek só lê uma fração de anexos grandes ("Length limit reached... first 5%").
+        // Por isso o contexto vai em LOTES: cada anexo e cada mensagem ficam pequenos.
+        // Ajuste aqui se o seu chat aceitar mais (ou menos).
+        this.maxAttachChars = 60000;     // tamanho de cada anexo .txt
+        this.maxMessageChars = 60000;    // total de anexos por mensagem
+        this.maxFilesPerMessage = 3;
         this.supportsFileAttach = true;
     }
 

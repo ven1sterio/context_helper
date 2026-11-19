@@ -24,7 +24,9 @@
         supportsFileAttach: false,
         maxInlineChars: 40000,
         maxContextChars: 150000,
-        maxAttachChars: 250000
+        maxAttachChars: 250000,
+        maxMessageChars: 2500000,
+        maxFilesPerMessage: 10
     };
 
     function getProvider() {

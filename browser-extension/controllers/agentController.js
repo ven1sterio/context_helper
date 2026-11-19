@@ -211,6 +211,32 @@
                 needContext = false;
             }
 
+            // Contexto em vários lotes: manda cada um e espera o "OK" antes do próximo.
+            if (composed && composed.preBatches && composed.preBatches.length > 0) {
+                const pre = composed.preBatches;
+                for (let b = 0; b < pre.length; b++) {
+                    if (!agentRunning) return;
+                    const inp = p.findInput();
+                    if (!inp) { window.DS.panel.toast('Campo de entrada perdido.'); return; }
+                    window.DS.panel.toast(`📦 Enviando contexto: mensagem ${b + 1}/${pre.length + 1}...`);
+                    await humanDelay(HUMAN_DELAY.beforeSend);
+                    const base = p.snapshotAssistant();
+                    const d = await ctx.deliverPrompt(inp, { text: pre[b].text, files: pre[b].files, preBatches: [] });
+                    if (d.aborted) { window.DS.panel.toast('⏹ Agente parado: já há um anexo de contexto no campo.'); return; }
+                    await sleep(150);
+                    const okSend = await p.pressSend(60000);
+                    if (!okSend) { window.DS.panel.toast(`⚠️ Falha ao enviar o lote ${b + 1}/${pre.length + 1}.`); return; }
+                    await humanDelay(HUMAN_DELAY.afterSend);
+                    const okWait = await waitForResponseComplete(conn.timeouts.response * 1000, base, showWaitMoreButton);
+                    if (!okWait) {
+                        if (agentRunning) window.DS.panel.toast(`Timeout esperando o "OK" do lote ${b + 1}.`);
+                        return;
+                    }
+                    await sleep(800);
+                }
+                composed = { text: composed.text, files: composed.files, preBatches: [], inline: composed.inline };
+            }
+
             const input = p.findInput();
             if (!input) { window.DS.panel.toast('Campo de entrada perdido.'); return; }
             await humanDelay(HUMAN_DELAY.beforeSend);
